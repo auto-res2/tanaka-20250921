@@ -1,0 +1,30 @@
+
+Input:
+The Python standard output and errors are provided below.
+Extract all information related to the experimental results from the standard output, and extract the Python error details from the errors, outputting them exactly as they are without any modifications.
+Do not extract unnecessary execution logs or information about Python package installations.
+
+# Standard Output
+=== uv sync start Sun Sep 21 10:08:03 AM UTC 2025 ===
+=== [PHASE 1/2] Smoke test start Sun Sep 21 10:08:03 AM UTC 2025 ===
+
+
+# Error
+error: Failed to parse: `pyproject.toml`
+  Caused by: TOML parse error at line 8, column 1
+  |
+8 | [project.dependencies]
+  | ^^^^^^^^^^^^^^^^^^^^^^
+invalid type: map, expected a sequence
+error: Failed to parse: `pyproject.toml`
+  Caused by: TOML parse error at line 8, column 1
+  |
+8 | [project.dependencies]
+  | ^^^^^^^^^^^^^^^^^^^^^^
+invalid type: map, expected a sequence
+
+Output:
+{
+    "extracted_output": "",
+    "extracted_error": "error: Failed to parse: `pyproject.toml`  Caused by: TOML parse error at line 8, column 1  |8 | [project.dependencies]  | ^^^^^^^^^^^^^^^^^^^^^^invalid type: map, expected a sequenceerror: Failed to parse: `pyproject.toml`  Caused by: TOML parse error at line 8, column 1  |8 | [project.dependencies]  | ^^^^^^^^^^^^^^^^^^^^^^invalid type: map, expected a sequence"
+}
