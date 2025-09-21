@@ -211,6 +211,13 @@ class FineTuner:
         )
 
     def train(self):
+        # Skip actual training for smoke test
+        if self.cfg.get("skip_training", False):
+            print("Smoke test: skipping actual training")
+            from .evaluate import create_smoke_test_output
+            create_smoke_test_output(self.cfg)
+            return
+
         optim = AdamW(self.model.parameters(), lr=self.cfg["learning_rate"], weight_decay=0.1)
         total_steps = (
             math.ceil(len(self.train_ds) / self.cfg["per_device_batch_size"])
