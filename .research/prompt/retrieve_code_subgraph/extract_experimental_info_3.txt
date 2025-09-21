@@ -1,0 +1,4404 @@
+
+Input:
+You are a researcher with expertise in engineering in the field of machine learning.
+
+# Instructions
+- The content described in “Repository Content” corresponds to the GitHub repository of the method described in “Method.”
+- Please extract the following two pieces of information from “Repository Content”:
+    - experimental_code：Extract the implementation sections that are directly related to the method described in “Method.”
+    - experimental_info：Extract and output the experimental settings related to the method described in “Method.”
+
+# Method
+The core methodology involves amortized Bayesian inference implemented by fine-tuning a pretrained Large Language Model (LLM) as a GFlowNet policy. GFlowNets are diversity-seeking reinforcement learning algorithms that learn to sample sequences (latent variables Z) with probability proportional to a given reward function. The reward function is defined as the joint likelihood 𝑝LM(𝑋𝑍𝑌) (or a tempered version), effectively training the GFlowNet policy to sample from the intractable posterior 𝑝LM(𝑍|𝑋,𝑌). The training utilizes a modified subtrajectory balance (SubTB) objective. The GFlowNet policy is initialized as a copy of the pretrained LLM and fine-tuned using LoRA for hardware efficiency. Training mini-batches are composed from the current policy, a tempered version of the policy, and a replay buffer storing past trajectories. Depending on the task, the GFlowNet policy can be conditioned on the input 𝑋 alone (for reasoning tasks to predict 𝑌 for unseen 𝑋) or on both 𝑋 and 𝑌 (for tasks like infilling where 𝑌 is available). For prediction, Bayesian model averaging is used by drawing multiple 𝑍 samples from the GFlowNet and then sampling 𝑌 from the base LLM, with a majority vote for the final answer. The approach is also framed as the E-step of an EM algorithm.
+
+# Repository Content
+File Path: infill_subj_arithmetic/data.py
+Content:
+import numpy as np
+import pandas as pd
+import json
+from hydra.utils import to_absolute_path
+
+def load_dataset(config, tokenizer, append_prompt_test=None):
+    if config.dataset.name == "integer":
+        train_path = to_absolute_path(config.dataset.train_path)
+        hw_path = to_absolute_path(config.dataset.hw_path)
+        test_path = to_absolute_path(config.dataset.test_path)
+        
+        data_train = json.load(open(train_path, 'r'))
+        data_hw = json.load(open(hw_path, 'r'))
+        data_test = json.load(open(test_path, 'r'))
+
+        train_queries = []
+        train_rationales = []
+        train_sols = []
+        train_weight = []
+
+        test_queries = []
+        test_num_sols = []
+
+        for sample in data_train[:config.dataset.num_train]:
+            train_queries.append(sample['str_query'])
+            train_rationales.append(sample['str_rationale'])
+            train_sols.append(sample['str_sol'])
+            train_weight.append(1)
+        print("train_queries", len(train_queries))
+        for sample in data_hw[:config.dataset.num_hw]:
+            train_queries.append(sample['str_query'])
+            train_rationales.append(None)
+            train_sols.append(sample['str_sol'])
+            train_weight.append(0.2)
+
+        train_weight = np.array(train_weight)
+        train_weight = train_weight / train_weight.sum()
+
+        for sample in data_test[:config.dataset.num_test]:
+            if append_prompt_test:
+                test_queries.append(append_prompt_test + sample['str_query'])
+            else:
+                test_queries.append(sample['str_query'])
+            if "num_sol" in sample:
+                test_num_sols.append(sample['num_sol'])
+            else:
+                test_num_sols = None
+        
+        encoded_train_queries = [tokenizer(query, return_tensors='pt')['input_ids'].cuda() for query in train_queries]
+        encoded_train_sols = [tokenizer(answer, return_tensors='pt')['input_ids'].cuda() for answer in train_sols]
+        encoded_test_queries = [tokenizer(query, return_tensors='pt')['input_ids'].cuda() for query in test_queries]
+   
+    elif config.dataset.name == "stories":
+        df = pd.read_csv(to_absolute_path(config.dataset.path))
+        data = []
+
+        for index in range(100, 1000):
+            row = df.iloc[index]
+            story = {}
+            story["str_query"] = row["sentence1"] + " " + row["sentence2"] + " " + row["sentence3"]
+            story["str_sol"] = config.dataset.sol_prefix + row["sentence5"]
+            story["str_rationale"] = " " + row["sentence4"][:-1]
+            # print(row['sentence1'])
+            # if index == config.dataset.max_data:
+            #     break
+            data.append(story)
+        
+        train_queries = []
+        train_rationales = []
+        train_sols = []
+        train_weight = []
+
+        test_queries = []
+        test_num_sols = []
+        test_sols = []
+
+        for i, sample in enumerate(data):
+            train_queries.append(sample['str_query'])
+            if config.dataset.use_rationales and i < config.dataset.max_data:
+                train_rationales.append(sample['str_rationale'])
+            else:
+                train_rationales.append(None)
+            train_sols.append(sample['str_sol'])
+            train_weight.append(1)
+
+        train_weight = np.array(train_weight)
+        train_weight = train_weight / train_weight.sum()
+
+        for sample in data:
+            test_queries.append(sample['str_query'])
+            if "num_sol" in sample:
+                test_num_sols.append(sample['num_sol'])
+            else:
+                test_num_sols = None
+            test_sols.append(sample['str_sol'])
+        
+        encoded_train_queries = [tokenizer(query, return_tensors='pt')['input_ids'].cuda() for query in train_queries]
+        encoded_train_sols = [tokenizer(answer, return_tensors='pt')['input_ids'].cuda() for answer in train_sols]
+        encoded_test_queries = [tokenizer(query, return_tensors='pt')['input_ids'].cuda() for query in test_queries]
+    
+    elif config.dataset.name == "stories_in_prompt_2":
+        df = pd.read_csv(to_absolute_path(config.dataset.path))
+        data = []
+
+        for index in range(100, 1000):
+            row = df.iloc[index]
+            story = {}
+            story["str_query"] = "Beginning: " + row["sentence1"] + " " + row["sentence2"] + " " + row["sentence3"]
+            story["str_query"] += "\nEnding: " + row["sentence5"] + "\nMiddle:"
+            story["str_sol"] =  row["sentence5"]
+            story["str_rationale"] = " " + row["sentence4"]
+            story["beginning"] = row["sentence1"] + " " + row["sentence2"] + " " + row["sentence3"]
+            # print(row['sentence1'])
+            # if index == config.dataset.max_data:
+            #     break
+            data.append(story)
+        
+        train_queries = []
+        train_rationales = []
+        train_sols = []
+        train_weight = []
+        train_beginning = []
+
+        test_queries = []
+        test_num_sols = []
+        test_sols = []
+        test_beginning = []
+
+        for i, sample in enumerate(data):
+            train_queries.append(sample['str_query'])
+            if config.dataset.use_rationales and i < config.dataset.max_data:
+                train_rationales.append(sample['str_rationale'])
+            else:
+                train_rationales.append(None)
+            train_sols.append(sample['str_sol'])
+            train_weight.append(1)
+            train_beginning.append(sample['beginning'])
+
+        train_weight = np.array(train_weight)
+        train_weight = train_weight / train_weight.sum()
+
+        for sample in data:
+            test_queries.append(sample['str_query'])
+            if "num_sol" in sample:
+                test_num_sols.append(sample['num_sol'])
+            else:
+                test_num_sols = None
+            test_sols.append(sample['str_sol'])
+            test_beginning.append(sample['beginning'])
+        
+        encoded_train_queries = [tokenizer(query, return_tensors='pt')['input_ids'].cuda() for query in train_queries]
+        encoded_train_sols = [tokenizer(answer, return_tensors='pt')['input_ids'].cuda() for answer in train_sols]
+        encoded_test_queries = [tokenizer(query, return_tensors='pt')['input_ids'].cuda() for query in test_queries]
+        encoded_train_beginning = [tokenizer(query, return_tensors='pt')['input_ids'].cuda() for query in train_beginning]
+        encoded_test_beginning = [tokenizer(query, return_tensors='pt')['input_ids'].cuda() for query in test_beginning]
+        return {
+            "train_queries": train_queries,
+            "train_rationales": train_rationales,
+            "train_sols": train_sols,
+            "test_sols": test_sols,
+            "train_beginning": train_beginning,
+            "test_beginning": test_beginning,
+            "encoded_train_queries": encoded_train_queries,
+            "encoded_train_sols": encoded_train_sols,
+            "test_queries": test_queries,
+            "encoded_test_queries": encoded_test_queries,
+            "encoded_train_beginning": encoded_train_beginning,
+            "encoded_test_beginning": encoded_test_beginning,
+            "train_weight": train_weight if config.dataset.name == "integer" else None,
+            "test_num_sols": test_num_sols if config.dataset.name == "integer" else None,
+        }
+    else:
+        raise NotImplementedError("Please select a valid dataset.")
+
+    return {
+        "train_queries": train_queries,
+        "train_rationales": train_rationales,
+        "train_sols": train_sols,
+        "test_sols": test_sols if config.dataset.name == "stories" else None,
+        "encoded_train_queries": encoded_train_queries,
+        "encoded_train_sols": encoded_train_sols,
+        "test_queries": test_queries,
+        "encoded_test_queries": encoded_test_queries,
+        "train_weight": train_weight if config.dataset.name == "integer" else None,
+        "test_num_sols": test_num_sols if config.dataset.name == "integer" else None,
+    }
+File Path: infill_subj_arithmetic/eval_arithmetic.py
+Content:
+import hydra
+import torch
+import numpy as np
+import random
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from tqdm import tqdm
+import bitsandbytes as bnb
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, PeftModel
+from hydra.utils import to_absolute_path
+import wandb
+from omegaconf import OmegaConf
+import json
+import os
+from rich.table import Table
+from rich import print
+from rich.console import Console
+
+from utils import generate, generate_and_return_eos_logprob, append_sol_and_remove_eos, base_to_lora, lora_to_base, run_evaluation, score_fast
+from rewards import load_reward
+from replay_buffer import load_replay_buffer
+from data import load_dataset
+
+
+def seed_everything(seed):
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def print_table(queries, rationales, solutions, rewards):
+    table = Table(show_header=True, header_style="bold blue")
+    table.add_column("Query", width=30)
+    table.add_column("Rationale", width=30)
+    table.add_column("Solution", width=30) if solutions is not None else None
+    table.add_column("Reward", width=10)
+    # import pdb; pdb.set_trace();
+    for query, rationale, solution, reward in zip(queries, rationales, solutions, rewards):
+        table.add_row(query, rationale[len(query):], solution, str(reward))
+    print(table)
+
+def generate_examples(model, tokenizer, encoded_input, eos_token_id, pad_token_id, vocab_nice_list, rew, max_eval_len, config):
+    generated_tokens, _, full_state = generate(model,
+                            encoded_input.repeat(10, 1),
+                            eos_token_id=eos_token_id,
+                            vocab_nice_mask=vocab_nice_list,
+                            max_len=max_eval_len,
+                            temperature=config.eval_temp,
+                            tokenizer=tokenizer,
+                            use_tools=config.use_tools,
+                            limit_capability=config.limit_capability,
+                            operators=config.operators,
+                            use_cache=not config.use_4bit)
+
+    generated_text = tokenizer.batch_decode(append_sol_and_remove_eos(full_state if config.use_tools else generated_tokens, [None,] * generated_tokens.size(0), eos_token_id, pad_token_id))
+    reward = rew.score(
+                    append_sol_and_remove_eos(full_state if config.use_tools else generated_tokens, [None,] * generated_tokens.size(0), eos_token_id, pad_token_id),
+                    skip_first=encoded_input.size(-1),
+                    solution_len=0).cpu().float().numpy().tolist()
+    return generated_text, reward
+
+
+def test(config, model, tokenizer, vocab_nice_list, dataset, eos_token_id, pad_token_id, step, max_eval_len):
+    # import pdb; pdb.set_trace();
+    if dataset["test_num_sols"] is not None:
+        accuracy, incorrect_examples = run_evaluation(model, tokenizer, dataset["encoded_test_queries"], 
+                                    dataset["test_num_sols"], eos_token_id, pad_token_id, vocab_nice_list, max_eval_len,
+                                    config.eval_bsz, config.use_tools, config.limit_capability, config.operators, not config.use_4bit)
+        with open(f'incorrect_examples_{step}.txt', 'w') as f:
+            for example in incorrect_examples:
+                f.write(str(example) + '\n')
+    
+        return accuracy
+    return 0
+
+
+def load_model(config):
+    if config.use_4bit:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype="float16",
+            bnb_4bit_use_double_quant=True,
+        )
+        model = AutoModelForCausalLM.from_pretrained(config.name,
+                                                trust_remote_code=True,
+                                                device_map="auto",
+                                                quantization_config=bnb_config)
+        model.gradient_checkpointing_enable()
+        model = prepare_model_for_kbit_training(model)
+        model.config.use_cache = False
+    else:
+        model = AutoModelForCausalLM.from_pretrained(config.name,
+                                                torch_dtype=torch.bfloat16,
+                                                trust_remote_code=True)
+        model.to(config.device)
+    
+    tokenizer = AutoTokenizer.from_pretrained(config.name, add_bos_token=False)
+    
+    if config.use_lora and not config.test_only:
+        lora_config = LoraConfig(
+            r=config.lora_config.r,
+            lora_alpha=config.lora_config.alpha,
+            target_modules=list(config.lora_config.target_modules),
+            lora_dropout=config.lora_config.dropout,
+            bias="none",
+        )
+        lora_model = get_peft_model(model, lora_config)
+        return lora_model, tokenizer
+    if config.test_only and config.load_checkpoint_path is not None:
+        model = PeftModel.from_pretrained(model, config.load_checkpoint_path)
+    return model, tokenizer
+
+
+@hydra.main(version_base=None, config_path='./configs/', config_name='rationale_buffer')
+def main(config):
+    print(os.getcwd())
+    if not config.test_only:
+        wandb.init(project="rationale_buffer_llm", mode=config.wandb_mode, config=OmegaConf.to_container(config, resolve=True))
+    model, tokenizer = load_model(config.model)
+
+    data_path = to_absolute_path(config.reward.reward_config.prompt_data.path)
+    data = json.load(open(data_path, 'r'))
+    train_queries = []
+    train_rationales = []
+    train_sols = []
+    for sample in data:
+        train_queries.append(sample['str_query'])
+        train_rationales.append(sample['str_rationale'])
+        train_sols.append(sample['str_sol'])
+    if config.reward.reward_config.prompt_data.num_points > 0:
+        
+        idxs = list(range(config.reward.reward_config.prompt_data.num_points))
+        random.shuffle(idxs)
+        prompt_text = '\n'.join([train_queries[i]+ " " + train_rationales[i] + train_sols[i] for i in idxs]) + '\n'
+    else:
+        prompt_text = ""
+    prompt_text = config.reward.reward_config.prompt_data.extra_text + prompt_text
+    print("Prompt text: ", prompt_text)
+
+    dataset = load_dataset(config, tokenizer, append_prompt_test=prompt_text)
+    reward, vocab_nice_list = load_reward(config.reward, model, tokenizer, dataset, config.min_len)
+    seed_everything(config.seed)
+
+
+    with torch.no_grad():
+        encoded_test_queries = dataset["encoded_test_queries"]
+        eos_token_id = tokenizer.eos_token_id
+        pad_token_id = tokenizer.eos_token_id
+        # print some examples
+        for _ in range(10):
+            query_ind = random.randint(0, len(encoded_test_queries)-1)
+            encoded_input = encoded_test_queries[query_ind]
+
+            text, rewards = generate_examples(model, tokenizer, encoded_input, eos_token_id, pad_token_id, vocab_nice_list, reward, config.max_eval_len, config)
+            print(f"Test example: {text}")
+            print(f'mean reward: {rewards}')
+
+        accuracy = test(config, model, tokenizer, vocab_nice_list, dataset, tokenizer.eos_token_id, tokenizer.eos_token_id, 0, config.max_eval_len)
+        print('accuracy: ', accuracy)
+
+if __name__ == '__main__':
+    main()
+
+File Path: infill_subj_arithmetic/eval_infill.py
+Content:
+import torch
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
+import argparse
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch.nn.functional as F
+from peft import PeftModel
+
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from nltk.translate.gleu_score import sentence_gleu
+from bert_score import BERTScorer
+from utils import generate
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--model_name", type=str, default="output/stories_sft")
+parser.add_argument("--temp", type=float, default=1.0)
+parser.add_argument("--max_eval_len", type=int, default=12)
+parser.add_argument("--batch_size", type=int, default=100)
+parser.add_argument("--load_checkpoint_path", type=str, default=None)
+parser.add_argument("--query_type", type=str, default="infill")
+args = parser.parse_args()
+
+
+scorer = BERTScorer(model_type="microsoft/deberta-xlarge-mnli", lang="en", rescale_with_baseline=True)
+
+
+load_checkpoint_path = args.load_checkpoint_path
+
+tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+model = AutoModelForCausalLM.from_pretrained(args.model_name,
+                                            torch_dtype=torch.bfloat16,
+                                            trust_remote_code=True,
+                                            use_auth_token=True)
+model.to('cuda')
+if load_checkpoint_path is not None:
+    model = PeftModel.from_pretrained(model, load_checkpoint_path)
+model.eval()
+
+
+
+df = pd.read_csv("data/stories.csv")
+data = []
+
+for index in range(0, 100):
+    row = df.iloc[index]
+    story = {}
+    if args.query_type == "infill":
+        story["str_query"] = "Beginning: " + row["sentence1"] + " " + row["sentence2"] + " " + row["sentence3"]
+        story["str_query"] += "\nEnding: " + row["sentence5"] + "\nMiddle:"
+    elif args.query_type == "beginning":
+        story["str_query"] = row["sentence1"] + " " + row["sentence2"] + " " + row["sentence3"]
+    story["str_sol"] = ". " + row["sentence5"]
+    story["str_rationale"] = " " + row["sentence4"][:-1]
+    story["beginning"] = row["sentence1"] + " " + row["sentence2"] + " " + row["sentence3"]
+
+    data.append(story)
+
+train_queries = []
+train_rationales = []
+train_sols = []
+train_weight = []
+train_beginning = []
+
+test_queries = []
+test_num_sols = []
+test_sols = []
+test_beginning = []
+
+for i, sample in enumerate(data):
+    train_queries.append(sample['str_query'])
+    train_rationales.append(sample['str_rationale'])
+    train_sols.append(sample['str_sol'])
+    train_weight.append(1)
+    train_beginning.append(sample['beginning'])
+
+train_weight = np.array(train_weight)
+train_weight = train_weight / train_weight.sum()
+
+for sample in data:
+    test_queries.append(sample['str_query'])
+    if "num_sol" in sample:
+        test_num_sols.append(sample['num_sol'])
+    else:
+        test_num_sols = None
+    test_sols.append(sample['str_sol'])
+    test_beginning.append(sample['beginning'])
+
+encoded_train_queries = [tokenizer(query, return_tensors='pt')['input_ids'].cuda() for query in train_queries]
+encoded_train_sols = [tokenizer(answer, return_tensors='pt')['input_ids'].cuda() for answer in train_sols]
+encoded_test_queries = [tokenizer(query, return_tensors='pt')['input_ids'].cuda() for query in test_queries]
+encoded_train_beginning = [tokenizer(query, return_tensors='pt')['input_ids'].cuda() for query in train_beginning]
+encoded_test_beginning = [tokenizer(query, return_tensors='pt')['input_ids'].cuda() for query in test_beginning]
+
+pad_token_id = tokenizer.eos_token_id
+eos_token_id = tokenizer.eos_token_id
+
+def compute_metrics(ref, cands):
+    # BLEU
+    ref_tokens = ref.split()
+    cands_tokens = [cand.split() for cand in cands]
+    bleu_scores = [sentence_bleu([ref_tokens], cand, smoothing_function=SmoothingFunction().method1) for cand in cands_tokens]
+
+    # GLEU
+    gleu_scores = [sentence_gleu([ref_tokens], cand) for cand in cands_tokens]
+
+    # BERTScore
+    P, R, F1 = scorer.score(cands, [ref]*len(cands), verbose=False)
+    bertscore_f1 = F1.tolist()
+
+    return bleu_scores, gleu_scores, bertscore_f1
+
+
+def eval_model(model, tokenizer, temp=1.0, max_eval_len=12, batch_size=100):
+    metrics = {
+        "bleu": [],
+        "gleu": [],
+        "bertscore_f1": []
+    }
+    for idx in tqdm(range(100)):
+        encoded_input = encoded_train_queries[idx]
+        with torch.no_grad():
+            generated_tokens, _, full_state = generate(model,
+                                    encoded_input.repeat(batch_size, 1),
+                                    eos_token_id=eos_token_id,
+                                    vocab_nice_mask=None,
+                                    max_len=max_eval_len,
+                                    temperature=temp,
+                                    tokenizer=tokenizer,
+                                    use_tools=False,
+                                    limit_capability=None,
+                                    operators=None,
+                                    use_cache=True)
+        torch.cuda.empty_cache()
+        
+        # generated_tokens = append_sol_and_remove_eos(model, encoded_input, generated_tokens, encoded_train_sols[idx], tokenizer)
+        generated_text = tokenizer.batch_decode(generated_tokens[:, encoded_input.shape[-1]:], skip_special_tokens=True)
+        # print(generated_text)
+        generated_text = [gt[1:] for gt in generated_text]
+        bleu, gleu, bertscore_f1 = compute_metrics(train_rationales[idx], generated_text)
+        metrics["bleu"].append(bleu)
+        metrics["gleu"].append(gleu)
+        metrics["bertscore_f1"].append(bertscore_f1)
+
+    return metrics
+
+
+eval_metrics = eval_model(model, tokenizer, temp=args.temp, max_eval_len=args.max_eval_len, batch_size=args.max_eval_len)
+
+print("BLEU: ", np.mean(eval_metrics["bleu"]))
+print("GLEU: ", np.mean(eval_metrics["gleu"]))
+print("BERTScore F1: ", np.mean(eval_metrics["bertscore_f1"]))
+File Path: infill_subj_arithmetic/main.py
+Content:
+import hydra
+import torch
+import numpy as np
+import random
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from tqdm import tqdm
+import bitsandbytes as bnb
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, PeftModel
+import wandb
+from omegaconf import OmegaConf
+import os
+from rich.table import Table
+from rich import print
+
+from utils import generate, generate_and_return_eos_logprob, append_sol_and_remove_eos, run_evaluation
+from rewards import load_reward
+from replay_buffer import load_replay_buffer
+from data import load_dataset
+
+
+def seed_everything(seed):
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def train(config, model, tokenizer, vocab_nice_list, rew, rbuffer, dataset):
+    logZ = torch.nn.Parameter(torch.tensor([config.logZ_init], dtype=torch.float, device=config.model.device))
+    if config.use_4bit:
+        opt = bnb.optim.PagedAdamW8bit([{'params': model.parameters(), 'lr': config.lr},
+                                {'params': [logZ,], 'lr': config.lr_logZ}])
+    else:
+        opt = torch.optim.AdamW([{'params': model.parameters(), 'lr': config.lr},
+                                {'params': [logZ,], 'lr': config.lr_logZ}])
+
+    pb = tqdm(range(config.train_steps))
+    desc_str = "Eval Reward: {:.3f} | Train Loss: {:.3f}, LogZ: {:.3f}, Reward: {:.3f}"
+    pb.set_description(desc_str.format(0, 0, 0, 0))
+    eval_reward = 0
+    
+    bsz = config.batch_size
+    grad_acc = config.grad_acc
+
+    pf_temp_high = config.pf_temp_high
+    pf_temp_low = config.pf_temp_low
+
+    subtb_lambda = config.subtb_lambda
+
+    max_len = config.max_len
+    max_eval_len = config.max_eval_len
+    min_len = config.min_len
+
+    loss_type = config.loss_type
+
+    reward_sched_start = config.reward_sched.start
+    reward_sched_end = config.reward_sched.end
+    reward_sched_horizon = config.reward_sched.horizon
+
+    get_reward_temp = lambda x : reward_sched_start + (reward_sched_end - reward_sched_start) * min(1, x / reward_sched_horizon)
+
+    encoded_train_queries = dataset["encoded_train_queries"]
+    encoded_train_sols = dataset["encoded_train_sols"]
+    encoded_test_queries = dataset["encoded_test_queries"]
+    train_weight = dataset["train_weight"]
+    eos_token_id = tokenizer.eos_token_id
+    pad_token_id = tokenizer.eos_token_id
+    get_lr_at_step = lambda x : min(x/20*config.lr, config.lr)
+    
+    for step in pb:
+        opt.zero_grad()
+        loss = 0.
+        # change reward temperature
+        rew.temperature = get_reward_temp(step)
+        for pg in opt.param_groups:
+            pg['lr'] = get_lr_at_step(step)
+        for _ in range(grad_acc):
+            # select an example
+            #query_ind = random.randint(0, len(encoded_train_queries)-1)
+            query_ind = np.random.choice(np.arange(len(encoded_train_queries)), p=train_weight)
+            encoded_input = encoded_train_queries[query_ind]
+            encoded_result = encoded_train_sols[query_ind]
+            if loss_type.startswith('modified'):
+                # choose a behavior policy
+                b_policy_choice = random.randint(0, 3)
+                reward_fn = lambda x: rew.score(
+                                append_sol_and_remove_eos(x,
+                                                        encoded_result.repeat(bsz, 1),
+                                                        eos_token_id,
+                                                        pad_token_id),
+                                skip_first=encoded_input.size(-1),
+                                solution_len=encoded_result.size(-1))
+                if b_policy_choice == 0:
+                    # using the action policy without tempering
+                    generated_text, logPF, eos_logprob, logrewards = \
+                        generate_and_return_eos_logprob(model, 
+                                                        encoded_input.repeat(bsz, 1),
+                                                        eos_token_id=eos_token_id,
+                                                        vocab_nice_mask=vocab_nice_list,
+                                                        reward_fn=reward_fn,
+                                                        max_len=max_len,
+                                                        min_len=min_len,
+                                                        temperature=1,
+                                                        tokenizer=tokenizer,
+                                                        use_tools=config.use_tools,
+                                                        limit_capability=config.limit_capability,
+                                                        operators=config.operators,
+                                                        use_cache=not config.use_4bit)
+                    rbuffer.add_batch(query=encoded_input,
+                                    answer=encoded_result,
+                                    rationales=generated_text[:, encoded_input.size(-1):],
+                                    logrewards=logrewards * rew.temperature, # undo the effect of reward tempering
+                                    tokenizer=tokenizer)
+                elif b_policy_choice == 1 and rbuffer.sample(bsz, query=encoded_input, answer=encoded_result)[0] is not None: # and step > 10:
+                    # using samples from the replay buffer
+                    action_seq, logrewards = rbuffer.sample(bsz, query=encoded_input, answer=encoded_result)
+                    if action_seq is None:
+                        continue
+                    logrewards *= (1/rew.temperature) # redo the effect of reward tempering
+                    generated_text, logPF, eos_logprob, logrewards_2 = \
+                        generate_and_return_eos_logprob(model, 
+                                                        encoded_input.repeat(action_seq.size(0), 1),
+                                                        eos_token_id=eos_token_id,
+                                                        reward_fn=reward_fn,
+                                                        vocab_nice_mask=vocab_nice_list,
+                                                        max_len=max_len,
+                                                        min_len=min_len,
+                                                        action_seq=action_seq,
+                                                        skip_rewards=True,
+                                                        tokenizer=tokenizer,
+                                                        use_tools=False,
+                                                        limit_capability=config.limit_capability,
+                                                        operators=config.operators,
+                                                        use_cache=not config.use_4bit)
+                else:
+                    # using the action policy with tempering
+                    generated_text, logPF, eos_logprob, logrewards = \
+                        generate_and_return_eos_logprob(model, 
+                                                        encoded_input.repeat(bsz, 1),
+                                                        eos_token_id=eos_token_id,
+                                                        reward_fn=reward_fn,
+                                                        vocab_nice_mask=vocab_nice_list,
+                                                        max_len=max_len,
+                                                        min_len=min_len,
+                                                        temperature=random.random()*(pf_temp_high-pf_temp_low)+pf_temp_low,
+                                                        tokenizer=tokenizer,
+                                                        use_tools=config.use_tools,
+                                                        limit_capability=config.limit_capability,
+                                                        operators=config.operators,
+                                                        use_cache=not config.use_4bit)
+                    rbuffer.add_batch(query=encoded_input,
+                                    answer=encoded_result,
+                                    rationales=generated_text[:, encoded_input.size(-1):],
+                                    logrewards=logrewards * rew.temperature, # undo the effect of reward tempering
+                                    tokenizer=tokenizer)
+                if loss_type == 'modified_db':
+                    # modified db loss with logpb=0
+                    db_loss = (logrewards[:, :-1] + logPF[:, :-1] + eos_logprob[:, 1:] - logrewards[:, 1:] - eos_logprob[:, :-1])**2
+                    # get a mask for newly generated tokens after the first eos in generated_text
+                    mask = (generated_text[:, encoded_input.size(-1):] == eos_token_id).cumsum(dim=-1) > 1
+                    # if mask is too short, pad it
+                    if mask.size(-1) < max_len:
+                        mask = torch.cat([mask, torch.ones(mask.size(0), max_len-1-mask.size(-1), dtype=torch.bool, device='cuda')], dim=-1)
+                    mask = mask[:, :max_len]
+                    # get trajectory lengths by summing the mask
+                    traj_len = (~mask).sum(dim=-1)
+                    # get rid of the loss for the terminating step
+                    db_loss[mask] = 0
+                    batch_loss = db_loss.sum(-1) / traj_len
+                    #batch_loss = batch_loss.topk(bsz//2, largest=False, sorted=False).values.mean()
+                elif loss_type == 'modified_subtb':
+                    # modified subTB loss with logpb=0
+                    delta = (logrewards[:, :-1] - eos_logprob[:, :-1] + logPF[:, :-1] - (logrewards[:, 1:] - eos_logprob[:, 1:]))
+                    #delta = F.huber_loss(logrewards[:, :-1] + logPF[:, :-1] + eos_logprob[:, 1:],
+                    #                     logrewards[:, 1:] + eos_logprob[:, :-1],
+                    #                     delta=.1,
+                    #                     reduction='none')
+                    delta_cumsum = torch.cat( [ torch.zeros_like(delta[:, :1]), delta ], 1).cumsum(1)
+                    # get a mask for tokens after the first eos in generated_text
+                    mask = (generated_text == eos_token_id).cumsum(dim=-1) > 1
+                    mask = mask[:, encoded_input.size(-1):]
+                    mask = mask[:, :max_len]
+                    # if mask is too short, pad it
+                    if mask.size(-1) < max_len:
+                        mask = torch.cat([mask, torch.ones(mask.size(0), max_len-mask.size(-1), dtype=torch.bool, device='cuda')], dim=-1)
+                    # get trajectory lengths by summing the mask
+
+                    batch_loss = 0.
+                    total_lambda = 0.
+                    for subtraj_len in range(1, max_len+1):
+                        subtb_term = (delta_cumsum[:, subtraj_len:] - delta_cumsum[:, :-subtraj_len])**2
+                        subtb_term[mask[:, subtraj_len - 1:]] = 0
+                        batch_loss += subtb_lambda ** (subtraj_len - 1) * subtb_term.sum()
+                        total_lambda += subtb_lambda ** (subtraj_len - 1) * (~mask[:, subtraj_len - 1:]).sum()
+                    batch_loss /= total_lambda
+            else:
+                raise NotImplementedError
+            loss += batch_loss.mean()
+            batch_loss.mean().backward()
+        opt.step()
+        
+        if step % config.log_interval == 0:
+            print(f'logZ: {logZ.item()}, loss: {loss.item()}')
+        if step % config.full_eval_interval == 0:
+            # accuracy, incorrect_examples = run_evaluation(model, tokenizer, encoded_test_queries, 
+            #                           dataset["test_num_sols"], eos_token_id, pad_token_id, vocab_nice_list, max_eval_len,
+            #                           config.eval_bsz, config.use_tools, config.limit_capability, config.operators)
+            accuracy = test(config, model, tokenizer, vocab_nice_list, dataset, eos_token_id, pad_token_id, step, max_eval_len)
+            print('accuracy: ', accuracy)
+            wandb.log({"accuracy": accuracy}, commit=False)
+
+        if step % config.eval_interval == 0:
+            query_ind = random.randint(0, len(encoded_test_queries)-1)
+            encoded_input = encoded_test_queries[query_ind]
+
+            text, rewards = generate_examples(model, tokenizer, encoded_input, eos_token_id, pad_token_id, vocab_nice_list, rew, max_eval_len, config)
+            sols = dataset["test_sols"][query_ind] if "test_sols" in dataset and dataset["test_sols"] else "Test" 
+            print_table([dataset["test_queries"][query_ind]] * max_eval_len, text, [sols] * max_eval_len, rewards)
+
+            query_ind = random.randint(0, len(encoded_train_queries)-1)
+            encoded_input = encoded_train_queries[query_ind]
+            text, rewards = generate_examples(model, tokenizer, encoded_input, eos_token_id, pad_token_id, vocab_nice_list, rew, max_eval_len, config)
+            print_table([dataset["train_queries"][query_ind]] * max_eval_len, text, [dataset["train_sols"][query_ind]] * max_eval_len, rewards)
+
+            rbuffer.save(f"buffer_{step}.pkl.gz")
+            model.save_pretrained(f'{wandb.run.name}_{step}.pt')
+        
+        wandb.log({"loss": loss.mean().item(), 'reward': logrewards.mean().item()})
+        pb.set_description(desc_str.format(eval_reward, loss.mean().item(), logZ.item(), logrewards.mean().item()))
+
+
+def print_table(queries, rationales, solutions, rewards):
+    table = Table(show_header=True, header_style="bold blue")
+    table.add_column("Query", width=30)
+    table.add_column("Rationale", width=30)
+    table.add_column("Solution", width=30) if solutions is not None else None
+    table.add_column("Reward", width=10)
+    # import pdb; pdb.set_trace();
+    for query, rationale, solution, reward in zip(queries, rationales, solutions, rewards):
+        table.add_row(query, rationale[len(query):], solution, str(reward))
+    print(table)
+
+
+def generate_examples(model, tokenizer, encoded_input, eos_token_id, pad_token_id, vocab_nice_list, rew, max_eval_len, config):
+    generated_tokens, _, full_state = generate(model,
+                            encoded_input.repeat(10, 1),
+                            eos_token_id=eos_token_id,
+                            vocab_nice_mask=vocab_nice_list,
+                            max_len=max_eval_len,
+                            temperature=config.eval_temp,
+                            tokenizer=tokenizer,
+                            use_tools=config.use_tools,
+                            limit_capability=config.limit_capability,
+                            operators=config.operators,
+                            use_cache=not config.use_4bit)
+
+    generated_text = tokenizer.batch_decode(append_sol_and_remove_eos(full_state if config.use_tools else generated_tokens, [None,] * generated_tokens.size(0), eos_token_id, pad_token_id))
+    reward = rew.score(
+                    append_sol_and_remove_eos(full_state if config.use_tools else generated_tokens, [None,] * generated_tokens.size(0), eos_token_id, pad_token_id),
+                    skip_first=encoded_input.size(-1),
+                    solution_len=0).cpu().float().numpy().tolist()
+    return generated_text, reward
+
+
+def test(config, model, tokenizer, vocab_nice_list, dataset, eos_token_id, pad_token_id, step, max_eval_len):
+    # import pdb; pdb.set_trace();
+    if dataset["test_num_sols"] is not None:
+        accuracy, incorrect_examples = run_evaluation(model, tokenizer, dataset["encoded_test_queries"], 
+                                    dataset["test_num_sols"], eos_token_id, pad_token_id, vocab_nice_list, max_eval_len,
+                                    config.eval_bsz, config.use_tools, config.limit_capability, config.operators, not config.use_4bit)
+        with open(f'incorrect_examples_{step}.txt', 'w') as f:
+            for example in incorrect_examples:
+                f.write(str(example) + '\n')
+    
+        return accuracy
+    return 0
+
+
+def load_model(config):
+    if config.use_4bit:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            llm_int8_has_fp16_weight=False,
+            bnb_4bit_quant_type="nf4",
+            llm_int8_threshold=6.0,
+            bnb_4bit_use_double_quant=True,
+        )
+        model = AutoModelForCausalLM.from_pretrained(config.name,
+                                                trust_remote_code=True,
+                                                device_map="auto",
+                                                torch_dtype=torch.bfloat16,
+                                                quantization_config=bnb_config)
+        # model.gradient_checkpointing_enable()
+        model = prepare_model_for_kbit_training(model)
+        model.config.use_cache = False
+    else:
+        model = AutoModelForCausalLM.from_pretrained(config.name,
+                                                torch_dtype=torch.bfloat16,
+                                                trust_remote_code=True)
+        model.to(config.device)
+        # model.gradient_checkpointing_enable()
+    
+    tokenizer = AutoTokenizer.from_pretrained(config.name, add_bos_token=False)
+    
+    if config.use_lora and not config.test_only:
+        lora_config = LoraConfig(
+            r=config.lora_config.r,
+            lora_alpha=config.lora_config.alpha,
+            target_modules=list(config.lora_config.target_modules),
+            lora_dropout=config.lora_config.dropout,
+            bias="none",
+        )
+        lora_model = get_peft_model(model, lora_config)
+        return lora_model, tokenizer
+    if config.test_only and config.load_checkpoint_path is not None:
+        model = PeftModel.from_pretrained(model, config.load_checkpoint_path)
+    # model = torch.compile(model)
+    return model, tokenizer
+
+
+@hydra.main(version_base=None, config_path='./configs/', config_name='rationale_buffer')
+def main(config):
+    print(os.getcwd())
+    if not config.test_only:
+        wandb.init(project="rationale_buffer_llm", mode=config.wandb_mode, config=OmegaConf.to_container(config, resolve=True))
+    model, tokenizer = load_model(config.model)
+    dataset = load_dataset(config, tokenizer)
+    reward, vocab_nice_list = load_reward(config.reward, model, tokenizer, dataset, config.min_len)
+    if config.use_replay_buffer and not config.test_only:
+        rbuffer = load_replay_buffer(config.replay_buffer, model, dataset, tokenizer, reward, config.max_len, config.min_len, vocab_nice_list, not config.use_4bit)
+    
+    seed_everything(config.seed)
+    if not config.test_only:
+        train(config, model, tokenizer, vocab_nice_list, reward, rbuffer, dataset)
+    else:
+        
+        encoded_test_queries = dataset["encoded_test_queries"]
+        eos_token_id = tokenizer.eos_token_id
+        pad_token_id = tokenizer.eos_token_id
+        for _ in range(10):
+            query_ind = random.randint(0, len(encoded_test_queries)-1)
+            encoded_input = encoded_test_queries[query_ind]
+
+            text, rewards = generate_examples(model, tokenizer, encoded_input, eos_token_id, pad_token_id, vocab_nice_list, reward, config.max_eval_len, config)
+            print(f"Test example: {text}")
+            print(f'mean reward: {rewards}')
+
+        accuracy = test(config, model, tokenizer, vocab_nice_list, dataset, tokenizer.eos_token_id, tokenizer.eos_token_id, 0, config.max_eval_len)
+        print('accuracy: ', accuracy)
+
+if __name__ == '__main__':
+    main()
+
+File Path: infill_subj_arithmetic/main_infill.py
+Content:
+import hydra
+import torch
+import numpy as np
+import random
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from tqdm import tqdm
+import bitsandbytes as bnb
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, PeftModel
+from hydra.utils import to_absolute_path
+import wandb
+from omegaconf import OmegaConf
+import json
+import os
+from rich.table import Table
+from rich import print
+from rich.console import Console
+
+from utils import generate, generate_and_return_eos_logprob, append_sol_and_remove_eos, base_to_lora, lora_to_base, run_evaluation, score_fast
+from rewards import load_reward
+# from replay_buffer import load_replay_buffer
+from data import load_dataset
+import replay_buffer
+
+
+def seed_everything(seed):
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def train(config, model, tokenizer, vocab_nice_list, rew, rbuffer, dataset):
+    logZ = torch.nn.Parameter(torch.tensor([config.logZ_init], dtype=torch.float, device=config.model.device))
+    if config.use_4bit:
+        opt = bnb.optim.PagedAdamW8bit([{'params': model.parameters(), 'lr': config.lr},
+                                {'params': [logZ,], 'lr': config.lr_logZ}])
+    else:
+        opt = torch.optim.AdamW([{'params': model.parameters(), 'lr': config.lr},
+                                {'params': [logZ,], 'lr': config.lr_logZ}])
+
+    pb = tqdm(range(config.train_steps))
+    desc_str = "Eval Reward: {:.3f} | Train Loss: {:.3f}, LogZ: {:.3f}, Reward: {:.3f}"
+    pb.set_description(desc_str.format(0, 0, 0, 0))
+    eval_reward = 0
+    
+    bsz = config.batch_size
+    grad_acc = config.grad_acc
+
+    pf_temp_high = config.pf_temp_high
+    pf_temp_low = config.pf_temp_low
+
+    subtb_lambda = config.subtb_lambda
+
+    max_len = config.max_len
+    max_eval_len = config.max_eval_len
+    min_len = config.min_len
+
+    loss_type = config.loss_type
+
+    reward_sched_start = config.reward_sched.start
+    reward_sched_end = config.reward_sched.end
+    reward_sched_horizon = config.reward_sched.horizon
+
+    get_reward_temp = lambda x : reward_sched_start + (reward_sched_end - reward_sched_start) * min(1, x / reward_sched_horizon)
+
+    encoded_train_queries = dataset["encoded_train_queries"]
+    encoded_train_sols = dataset["encoded_train_sols"]
+    encoded_test_queries = dataset["encoded_test_queries"]
+    encoded_train_beginning = dataset["encoded_train_beginning"]
+    train_weight = dataset["train_weight"]
+    eos_token_id = tokenizer.eos_token_id
+    pad_token_id = tokenizer.eos_token_id
+    get_lr_at_step = lambda x : min(x/20*config.lr, config.lr)
+    
+    for step in pb:
+        opt.zero_grad()
+        loss = 0.
+        # change reward temperature
+        rew.temperature = get_reward_temp(step)
+        for pg in opt.param_groups:
+            pg['lr'] = get_lr_at_step(step)
+        for _ in range(grad_acc):
+            # select an example
+            #query_ind = random.randint(0, len(encoded_train_queries)-1)
+            query_ind = np.random.choice(np.arange(len(encoded_train_queries)), p=train_weight)
+            encoded_input = encoded_train_queries[query_ind]
+            encoded_result = encoded_train_sols[query_ind]
+            encoded_beginning = encoded_train_beginning[query_ind]
+            if loss_type.startswith('modified'):
+                # choose a behavior policy
+                b_policy_choice = random.randint(0, 3)
+                reward_fn = lambda x: rew.score(
+                                append_sol_and_remove_eos(torch.cat((encoded_beginning.repeat(bsz, 1), x[:, encoded_input.size(-1):]), axis=1),
+                                                        encoded_result.repeat(bsz, 1),
+                                                        eos_token_id,
+                                                        pad_token_id),
+                                infills=x[:, encoded_input.size(-1):],
+                                skip_first=encoded_beginning.size(-1),
+                                solution_len=encoded_result.size(-1))
+                if b_policy_choice == 0:
+                    # using the action policy without tempering
+                    generated_text, logPF, eos_logprob, logrewards = \
+                        generate_and_return_eos_logprob(model, 
+                                                        encoded_input.repeat(bsz, 1),
+                                                        eos_token_id=eos_token_id,
+                                                        vocab_nice_mask=vocab_nice_list,
+                                                        reward_fn=reward_fn,
+                                                        max_len=max_len,
+                                                        min_len=min_len,
+                                                        temperature=1,
+                                                        tokenizer=tokenizer,
+                                                        use_tools=config.use_tools,
+                                                        limit_capability=config.limit_capability,
+                                                        operators=config.operators,
+                                                        use_cache=not config.use_4bit)
+                    rbuffer.add_batch(query=encoded_input,
+                                    answer=encoded_result,
+                                    rationales=generated_text[:, encoded_input.size(-1):],
+                                    logrewards=logrewards * rew.temperature, # undo the effect of reward tempering
+                                    tokenizer=tokenizer)
+                elif b_policy_choice == 1 and rbuffer.sample(bsz, query=encoded_input, answer=encoded_result)[0] is not None: # and step > 10:
+                    # using samples from the replay buffer
+                    action_seq, logrewards = rbuffer.sample(bsz, query=encoded_input, answer=encoded_result)
+                    if action_seq is None:
+                        continue
+                    logrewards *= (1/rew.temperature) # redo the effect of reward tempering
+                    generated_text, logPF, eos_logprob, logrewards_2 = \
+                        generate_and_return_eos_logprob(model, 
+                                                        encoded_input.repeat(action_seq.size(0), 1),
+                                                        eos_token_id=eos_token_id,
+                                                        reward_fn=reward_fn,
+                                                        vocab_nice_mask=vocab_nice_list,
+                                                        max_len=max_len,
+                                                        min_len=min_len,
+                                                        action_seq=action_seq,
+                                                        skip_rewards=True,
+                                                        tokenizer=tokenizer,
+                                                        use_tools=False,
+                                                        limit_capability=config.limit_capability,
+                                                        operators=config.operators,
+                                                        use_cache=not config.use_4bit)
+                else:
+                    # using the action policy with tempering
+                    generated_text, logPF, eos_logprob, logrewards = \
+                        generate_and_return_eos_logprob(model, 
+                                                        encoded_input.repeat(bsz, 1),
+                                                        eos_token_id=eos_token_id,
+                                                        reward_fn=reward_fn,
+                                                        vocab_nice_mask=vocab_nice_list,
+                                                        max_len=max_len,
+                                                        min_len=min_len,
+                                                        temperature=random.random()*(pf_temp_high-pf_temp_low)+pf_temp_low,
+                                                        tokenizer=tokenizer,
+                                                        use_tools=config.use_tools,
+                                                        limit_capability=config.limit_capability,
+                                                        operators=config.operators,
+                                                        use_cache=not config.use_4bit)
+                    rbuffer.add_batch(query=encoded_input,
+                                    answer=encoded_result,
+                                    rationales=generated_text[:, encoded_input.size(-1):],
+                                    logrewards=logrewards * rew.temperature, # undo the effect of reward tempering
+                                    tokenizer=tokenizer)
+                if loss_type == 'modified_db':
+                    # modified db loss with logpb=0
+                    db_loss = (logrewards[:, :-1] + logPF[:, :-1] + eos_logprob[:, 1:] - logrewards[:, 1:] - eos_logprob[:, :-1])**2
+                    # get a mask for newly generated tokens after the first eos in generated_text
+                    mask = (generated_text[:, encoded_input.size(-1):] == eos_token_id).cumsum(dim=-1) > 1
+                    # if mask is too short, pad it
+                    if mask.size(-1) < max_len:
+                        mask = torch.cat([mask, torch.ones(mask.size(0), max_len-1-mask.size(-1), dtype=torch.bool, device='cuda')], dim=-1)
+                    mask = mask[:, :max_len]
+                    # get trajectory lengths by summing the mask
+                    traj_len = (~mask).sum(dim=-1)
+                    # get rid of the loss for the terminating step
+                    db_loss[mask] = 0
+                    batch_loss = db_loss.sum(-1) / traj_len
+                    #batch_loss = batch_loss.topk(bsz//2, largest=False, sorted=False).values.mean()
+                elif loss_type == 'modified_subtb':
+                    # modified subTB loss with logpb=0
+                    delta = (logrewards[:, :-1] - eos_logprob[:, :-1] + logPF[:, :-1] - (logrewards[:, 1:] - eos_logprob[:, 1:]))
+                    #delta = F.huber_loss(logrewards[:, :-1] + logPF[:, :-1] + eos_logprob[:, 1:],
+                    #                     logrewards[:, 1:] + eos_logprob[:, :-1],
+                    #                     delta=.1,
+                    #                     reduction='none')
+                    delta_cumsum = torch.cat( [ torch.zeros_like(delta[:, :1]), delta ], 1).cumsum(1)
+                    # get a mask for tokens after the first eos in generated_text
+                    mask = (generated_text == eos_token_id).cumsum(dim=-1) > 1
+                    mask = mask[:, encoded_input.size(-1):]
+                    mask = mask[:, :max_len]
+                    # if mask is too short, pad it
+                    if mask.size(-1) < max_len:
+                        mask = torch.cat([mask, torch.ones(mask.size(0), max_len-mask.size(-1), dtype=torch.bool, device='cuda')], dim=-1)
+                    # get trajectory lengths by summing the mask
+
+                    batch_loss = 0.
+                    total_lambda = 0.
+                    for subtraj_len in range(1, max_len+1):
+                        subtb_term = (delta_cumsum[:, subtraj_len:] - delta_cumsum[:, :-subtraj_len])**2
+                        subtb_term[mask[:, subtraj_len - 1:]] = 0
+                        batch_loss += subtb_lambda ** (subtraj_len - 1) * subtb_term.sum()
+                        total_lambda += subtb_lambda ** (subtraj_len - 1) * (~mask[:, subtraj_len - 1:]).sum()
+                    batch_loss /= total_lambda
+                elif loss_type == "ppo":
+                    # PPO loss
+                    # get a mask for tokens after the first eos in generated_text
+                    mask = (generated_text == eos_token_id).cumsum(dim=-1) > 1
+                    mask = mask[:, encoded_input.size(-1):]
+                    mask = mask[:, :max_len]
+                    # if mask is too short, pad it
+                    if mask.size(-1) < max_len:
+                        mask = torch.cat([mask, torch.ones(mask.size(0), max_len-mask.size(-1), dtype=torch.bool, device='cuda')], dim=-1)
+                    # get trajectory lengths by summing the mask
+                    traj_len = (~mask).sum(dim=-1)
+                    # get rid of the loss for the terminating step
+                    logrewards[mask] = 0
+                    batch_loss = logrewards.sum(-1) / traj_len
+
+            else:
+                raise NotImplementedError
+            loss += batch_loss.mean()
+            batch_loss.mean().backward()
+        opt.step()
+        
+        if step % config.log_interval == 0:
+            print(f'logZ: {logZ.item()}, loss: {loss.item()}')
+        if step % config.full_eval_interval == 0:
+            # accuracy, incorrect_examples = run_evaluation(model, tokenizer, encoded_test_queries, 
+            #                           dataset["test_num_sols"], eos_token_id, pad_token_id, vocab_nice_list, max_eval_len,
+            #                           config.eval_bsz, config.use_tools, config.limit_capability, config.operators)
+            accuracy = test(config, model, tokenizer, vocab_nice_list, dataset, eos_token_id, pad_token_id, step, max_eval_len)
+            print('accuracy: ', accuracy)
+            wandb.log({"accuracy": accuracy}, commit=False)
+
+        if step % config.eval_interval == 0:
+            query_ind = random.randint(0, len(encoded_test_queries)-1)
+            encoded_input = encoded_test_queries[query_ind]
+
+            text, rewards = generate_examples(model, tokenizer, encoded_input, eos_token_id, pad_token_id, vocab_nice_list, rew, max_eval_len, config)
+            sols = dataset["test_sols"][query_ind] if "test_sols" in dataset and dataset["test_sols"] else "Test" 
+            print_table([dataset["test_queries"][query_ind]] * max_eval_len, text, [sols] * max_eval_len, rewards)
+
+            query_ind = random.randint(0, len(encoded_train_queries)-1)
+            encoded_input = encoded_train_queries[query_ind]
+            text, rewards = generate_examples(model, tokenizer, encoded_input, eos_token_id, pad_token_id, vocab_nice_list, rew, max_eval_len, config)
+            print_table([dataset["train_queries"][query_ind]] * max_eval_len, text, [dataset["train_sols"][query_ind]] * max_eval_len, rewards)
+
+            rbuffer.save(f"buffer_{step}.pkl.gz")
+            model.save_pretrained(f'{wandb.run.name}_{step}.pt')
+        
+        wandb.log({"loss": loss.mean().item(), 'reward': logrewards.mean().item()})
+        pb.set_description(desc_str.format(eval_reward, loss.mean().item(), logZ.item(), logrewards.mean().item()))
+
+
+def print_table(queries, rationales, solutions, rewards):
+    table = Table(show_header=True, header_style="bold blue")
+    table.add_column("Query", width=30)
+    table.add_column("Rationale", width=30)
+    table.add_column("Solution", width=30) if solutions is not None else None
+    table.add_column("Reward", width=10)
+    # import pdb; pdb.set_trace();
+    for query, rationale, solution, reward in zip(queries, rationales, solutions, rewards):
+        table.add_row(query, rationale[len(query):], solution, str(reward))
+    print(table)
+
+
+def generate_examples(model, tokenizer, encoded_input, eos_token_id, pad_token_id, vocab_nice_list, rew, max_eval_len, config):
+    generated_tokens, _, full_state = generate(model,
+                            encoded_input.repeat(10, 1),
+                            eos_token_id=eos_token_id,
+                            vocab_nice_mask=vocab_nice_list,
+                            max_len=max_eval_len,
+                            temperature=config.eval_temp,
+                            tokenizer=tokenizer,
+                            use_tools=config.use_tools,
+                            limit_capability=config.limit_capability,
+                            operators=config.operators,
+                            use_cache=not config.use_4bit)
+
+    generated_text = tokenizer.batch_decode(append_sol_and_remove_eos(full_state if config.use_tools else generated_tokens, [None,] * generated_tokens.size(0), eos_token_id, pad_token_id))
+    reward = rew.score(
+                    append_sol_and_remove_eos(generated_tokens, [None,] * generated_tokens.size(0), eos_token_id, pad_token_id),
+                    infills=generated_tokens[:, encoded_input.size(-1):],
+                    skip_first=encoded_input.size(-1),
+                    solution_len=0).cpu().float().numpy().tolist()
+    return generated_text, reward
+
+
+def test(config, model, tokenizer, vocab_nice_list, dataset, eos_token_id, pad_token_id, step, max_eval_len):
+    # import pdb; pdb.set_trace();
+    if dataset["test_num_sols"] is not None:
+        accuracy, incorrect_examples = run_evaluation(model, tokenizer, dataset["encoded_test_queries"], 
+                                    dataset["test_num_sols"], eos_token_id, pad_token_id, vocab_nice_list, max_eval_len,
+                                    config.eval_bsz, config.use_tools, config.limit_capability, config.operators, not config.use_4bit)
+        with open(f'incorrect_examples_{step}.txt', 'w') as f:
+            for example in incorrect_examples:
+                f.write(str(example) + '\n')
+    
+        return accuracy
+    return 0
+
+
+def load_model(config):
+    if config.use_4bit:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            llm_int8_has_fp16_weight=False,
+            bnb_4bit_quant_type="nf4",
+            llm_int8_threshold=6.0,
+            bnb_4bit_use_double_quant=True,
+        )
+        model = AutoModelForCausalLM.from_pretrained(config.name,
+                                                trust_remote_code=True,
+                                                device_map="auto",
+                                                torch_dtype=torch.bfloat16,
+                                                quantization_config=bnb_config)
+        # model.gradient_checkpointing_enable()
+        model = prepare_model_for_kbit_training(model)
+        model.config.use_cache = False
+    else:
+        model = AutoModelForCausalLM.from_pretrained(config.name,
+                                                torch_dtype=torch.bfloat16,
+                                                trust_remote_code=True)
+        model.to(config.device)
+        # model.gradient_checkpointing_enable()
+    
+    tokenizer = AutoTokenizer.from_pretrained(config.name, add_bos_token=False)
+    
+    if config.use_lora and not config.test_only:
+        lora_config = LoraConfig(
+            r=config.lora_config.r,
+            lora_alpha=config.lora_config.alpha,
+            target_modules=list(config.lora_config.target_modules),
+            lora_dropout=config.lora_config.dropout,
+            bias="none",
+        )
+        lora_model = get_peft_model(model, lora_config)
+        return lora_model, tokenizer
+    if config.test_only and config.load_checkpoint_path is not None:
+        model = PeftModel.from_pretrained(model, config.load_checkpoint_path)
+    # model = torch.compile(model)
+    return model, tokenizer
+
+def load_replay_buffer(config, model, dataset, tokenizer, rew, max_len, min_len, vocab_nice_list, use_cache):
+    rbuffer = replay_buffer.ReplayBuffer(config.size, eos_token_id=tokenizer.eos_token_id)
+    base_to_lora(model)
+    # add handcrafted rationales to the replay buffer
+    for i in range(len(dataset["encoded_train_queries"])):
+        if dataset["train_rationales"][i] is None:
+            continue
+        encoded_rationale = tokenizer(dataset["train_rationales"][i], return_tensors='pt')['input_ids'].cuda()
+        if encoded_rationale.size(-1) > max_len:
+            continue
+        reward_fn = lambda x: rew.score(
+                                append_sol_and_remove_eos(torch.cat((dataset["encoded_train_beginning"][i], x[:, dataset["encoded_train_queries"][i].shape[-1]:]), axis=1),
+                                                        dataset["encoded_train_sols"][i],
+                                                        tokenizer.eos_token_id,
+                                                        tokenizer.eos_token_id),
+                                infills=x[:, dataset["encoded_train_queries"][i].shape[-1]:],
+                                skip_first=dataset["encoded_train_beginning"][i].size(-1),
+                                solution_len=dataset["encoded_train_sols"][i].size(-1))
+        with torch.no_grad():
+            # import pdb; pdb.set_trace();
+            logrewards = generate_and_return_eos_logprob(model, 
+                                                            dataset["encoded_train_queries"][i],
+                                                            eos_token_id=tokenizer.eos_token_id,
+                                                            vocab_nice_mask=vocab_nice_list,
+                                                            reward_fn=reward_fn,
+                                                            max_len=max_len,
+                                                            min_len=min_len,
+                                                            temperature=1,
+                                                            action_seq=encoded_rationale,
+                                                            tokenizer=tokenizer,
+                                                            use_tools=config.use_tools,
+                                                            use_cache=use_cache)[3]
+        rbuffer.add_batch(query=dataset["encoded_train_queries"][i],
+                        answer=dataset["encoded_train_sols"][i],
+                        rationales=encoded_rationale,
+                        logrewards=logrewards,
+                        tokenizer=tokenizer)
+    return rbuffer
+
+
+@hydra.main(version_base=None, config_path='./configs/', config_name='rationale_buffer')
+def main(config):
+    print(os.getcwd())
+    if not config.test_only:
+        wandb.init(project="rationale_buffer_llm", mode=config.wandb_mode, config=OmegaConf.to_container(config, resolve=True))
+    model, tokenizer = load_model(config.model)
+    dataset = load_dataset(config, tokenizer)
+    reward, vocab_nice_list = load_reward(config.reward, model, tokenizer, dataset, config.min_len)
+    if config.use_replay_buffer and not config.test_only:
+        rbuffer = load_replay_buffer(config.replay_buffer, model, dataset, tokenizer, reward, config.max_len, config.min_len, vocab_nice_list, not config.use_4bit)
+    
+    seed_everything(config.seed)
+    if not config.test_only:
+        train(config, model, tokenizer, vocab_nice_list, reward, rbuffer, dataset)
+    else:
+        
+        encoded_test_queries = dataset["encoded_test_queries"]
+        eos_token_id = tokenizer.eos_token_id
+        pad_token_id = tokenizer.eos_token_id
+        for _ in range(10):
+            query_ind = random.randint(0, len(encoded_test_queries)-1)
+            encoded_input = encoded_test_queries[query_ind]
+
+            text, rewards = generate_examples(model, tokenizer, encoded_input, eos_token_id, pad_token_id, vocab_nice_list, reward, config.max_eval_len, config)
+            print(f"Test example: {text}")
+            print(f'mean reward: {rewards}')
+
+        accuracy = test(config, model, tokenizer, vocab_nice_list, dataset, tokenizer.eos_token_id, tokenizer.eos_token_id, 0, config.max_eval_len)
+        print('accuracy: ', accuracy)
+
+if __name__ == '__main__':
+    main()
+
+File Path: infill_subj_arithmetic/make_sft_data.py
+Content:
+import pyarrow as pa
+import pandas as pd
+import numpy as np
+
+df = pd.read_csv("data/stories.csv")
+data = []
+data_strs = []
+
+for index in range(100, 1000):
+    row = df.iloc[index]
+    data_strs.append(row["sentence1"] + " " + row["sentence2"] + " " + row["sentence3"] + " " + row["sentence4"] + " " + row["sentence5"])
+
+table = pa.Table.from_arrays([data_strs], names=['text'])
+
+import pyarrow.csv
+pa.csv.write_csv(table, 'data/stories_sft.csv', write_options=pa.csv.WriteOptions(include_header=True))
+
+File Path: infill_subj_arithmetic/replay_buffer.py
+Content:
+import torch
+import heapq
+import random
+import pickle
+import gzip
+import numpy as np
+
+import editdistance
+from utils import base_to_lora, append_sol_and_remove_eos, generate_and_return_eos_logprob
+
+class ReplayBuffer:
+    '''
+    A relay buffer that uses a heap to keep the max_size items with the highest reward
+    '''
+    def __init__(self, max_len, eos_token_id, sim_tolerance=0.25):
+        self.max_len = max_len
+        self.eos_token_id = eos_token_id
+        self.sim_tolerance = sim_tolerance
+        self.reset()
+
+    def reset(self):
+        self._buffer = {}
+    
+    def add(self, item):
+        '''
+        add an item to the buffer, where item = [log reward, tensor of shape (seq_len, )]
+        '''
+        # if item is already in the buffer, skip it
+        # import pdb; pdb.set_trace();
+        str_query_answer = item['str_query_answer']
+        if item['str_rationale'] in self._buffer[str_query_answer]['exists']:
+            return
+        # if the edit distance between item and any item in the buffer is small, skip it
+        tokenized_rationale = [x for x in item['tensor_rationale'].tolist() if x != self.eos_token_id]
+        for buffer_item in self._buffer[str_query_answer]['rationales']:
+            tokenized_existing_rationale = [x for x in buffer_item[2].tolist() if x != self.eos_token_id]
+            if editdistance.eval(tokenized_rationale, tokenized_existing_rationale) < (len(tokenized_rationale) + len(tokenized_existing_rationale))*self.sim_tolerance:
+                if buffer_item[0] >= item['logreward']:
+                    return
+                else:
+                    self._buffer[str_query_answer]['exists'].remove(buffer_item[1])
+                    self._buffer[str_query_answer]['rationales'].remove(buffer_item)
+                    heapq.heapify(self._buffer[str_query_answer]['rationales'])
+                    self._buffer[str_query_answer]['exists'].add(item['str_rationale'])
+                    heapq.heappush(self._buffer[str_query_answer]['rationales'],
+                        (item['logreward'], item['str_rationale'], item['tensor_rationale'], item['full_logrewards']))
+                    return
+        self._buffer[str_query_answer]['exists'].add(item['str_rationale'])
+        if len(self._buffer[str_query_answer]['rationales']) >= self.max_len:
+            popped = heapq.heappushpop(self._buffer[str_query_answer]['rationales'],
+                                       (item['logreward'], item['str_rationale'], item['tensor_rationale'], item['full_logrewards']))
+            self._buffer[str_query_answer]['exists'].remove(popped[1])
+        else:
+            heapq.heappush(self._buffer[str_query_answer]['rationales'],
+                           (item['logreward'], item['str_rationale'], item['tensor_rationale'], item['full_logrewards']))
+
+    def add_batch(self, query, answer, rationales, logrewards, tokenizer):
+        '''
+        add a batch of items to the buffer
+        '''
+        str_query = ' '.join([str(x) for x in query.tolist()])
+        if answer is not None:
+            str_answer = ' '.join([str(x) for x in answer.tolist()])
+        else:
+            str_answer = 'None'
+        str_query_answer = '|'.join([str_query, str_answer])
+        if str_query_answer not in self._buffer:
+            self._buffer[str_query_answer] = {'tensor_query': query,
+                                              'tensor_answer': answer,
+                                              'rationales': [],
+                                              'exists': set()}
+        rationales[(rationales == self.eos_token_id).cumsum(dim=-1) >= 1] = self.eos_token_id
+        token_rationales = tokenizer.batch_decode(rationales)
+        for i in range(rationales.size(0)):
+            #str_rationale = ' '.join([str(x) for x in rationales[i].tolist() if x != self.eos_token_id])
+            str_rationale = token_rationales[i].replace('<|endoftext|>', '').strip()
+            self.add({'logreward': logrewards[i, (rationales[i] != self.eos_token_id).sum()].item(),
+                      'str_query_answer': str_query_answer,
+                      'str_rationale': str_rationale,
+                      'tensor_rationale': rationales[i],
+                      'full_logrewards': logrewards[i, :]})
+    
+    def sample(self, batch_size, query, answer):
+        '''
+        uniformly sample a batch of items from the buffer,
+        and return a stacked tensor
+        '''
+        str_query = ' '.join([str(x) for x in query.tolist()])
+        if answer is not None:
+            str_answer = ' '.join([str(x) for x in answer.tolist()])
+        else:
+            str_answer = 'None'
+        str_query_answer = '|'.join([str_query, str_answer])
+        if str_query_answer not in self._buffer:
+            return None, None
+        query_answer_buffer = self._buffer[str_query_answer]['rationales']
+        if len(query_answer_buffer) < batch_size:
+            # if the buffer is not full, use pad_sequence and return all items
+            return torch.nn.utils.rnn.pad_sequence([item[2] for item in query_answer_buffer],
+                                                   batch_first=True,
+                                                   padding_value=self.eos_token_id), \
+                   torch.nn.utils.rnn.pad_sequence([item[3] for item in query_answer_buffer],
+                                                   batch_first=True,
+                                                   padding_value=0)
+        else:
+            # do prioritized sampling
+            priorities  = [item[0] for item in query_answer_buffer]
+            priorities = np.array(priorities)
+            priorities = priorities - np.max(priorities)
+            idx = np.random.choice(len(query_answer_buffer), batch_size, p=np.exp(priorities)/np.sum(np.exp(priorities)), replace=True)
+            return torch.nn.utils.rnn.pad_sequence([query_answer_buffer[i][2] for i in idx],
+                                                   batch_first=True,
+                                                   padding_value=self.eos_token_id), \
+                   torch.nn.utils.rnn.pad_sequence([query_answer_buffer[i][3] for i in idx],
+                                                   batch_first=True,
+                                                   padding_value=0)
+    def print(self):
+        for key in self._buffer:
+            print(key)
+            for item in self._buffer[key]['rationales']:
+                print(item[1])
+            print('')
+    
+    def save(self, path):
+        with gzip.open(path, 'wb') as f:
+            pickle.dump(self._buffer, f)
+
+
+def load_replay_buffer(config, model, dataset, tokenizer, rew, max_len, min_len, vocab_nice_list, use_cache):
+    rbuffer = ReplayBuffer(config.size, eos_token_id=tokenizer.eos_token_id)
+    base_to_lora(model)
+    # add handcrafted rationales to the replay buffer
+    for i in range(len(dataset["encoded_train_queries"])):
+        if dataset["train_rationales"][i] is None:
+            continue
+        encoded_rationale = tokenizer(dataset["train_rationales"][i], return_tensors='pt')['input_ids'].cuda()
+        reward_fn = lambda x: rew.score(
+                                append_sol_and_remove_eos(x,
+                                                        dataset["encoded_train_sols"][i],
+                                                        tokenizer.eos_token_id,
+                                                        tokenizer.eos_token_id),
+                                skip_first=dataset["encoded_train_queries"][i].size(-1),
+                                solution_len=dataset["encoded_train_sols"][i].size(-1))
+        with torch.no_grad():
+            logrewards = generate_and_return_eos_logprob(model, 
+                                                            dataset["encoded_train_queries"][i],
+                                                            eos_token_id=tokenizer.eos_token_id,
+                                                            vocab_nice_mask=vocab_nice_list,
+                                                            reward_fn=reward_fn,
+                                                            max_len=max_len,
+                                                            min_len=min_len,
+                                                            temperature=1,
+                                                            action_seq=encoded_rationale,
+                                                            tokenizer=tokenizer,
+                                                            use_tools=config.use_tools,
+                                                            use_cache=use_cache)[3]
+        rbuffer.add_batch(query=dataset["encoded_train_queries"][i],
+                        answer=dataset["encoded_train_sols"][i],
+                        rationales=encoded_rationale,
+                        logrewards=logrewards,
+                        tokenizer=tokenizer)
+    return rbuffer
+
+File Path: infill_subj_arithmetic/rewards.py
+Content:
+import torch
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from utils import score_fast, lora_to_base, base_to_lora
+from hydra.utils import to_absolute_path
+import json
+from omegaconf import OmegaConf
+
+def get_reward(rewards, rewards_args):
+    # reward is a list with the names of rewards to consider
+    return globals()[rewards[0]](**rewards_args[0])
+
+
+class Reward:
+    def score(self, input_batch):
+        # input_batch is shape b x ... 
+        # output is shape b
+        raise NotImplementedError("")
+
+
+class FrozenModelWithPrompt(Reward):
+    def __init__(self, model, prompt, eos_token_id, temperature=1., min_len=0, vocab_alpha=-50.,
+                 solution_beta=1., vocab_nice_mask=None, vocab_naughty_mask=None, len_beta=0):
+        self.model = model
+        self.model.eval()
+        self.temperature = temperature
+        self.eos_token_id = eos_token_id
+        self.solution_beta = solution_beta
+        self.vocab_nice_mask = vocab_nice_mask
+        self.vocab_naughty_mask = vocab_naughty_mask
+        self.vocab_alpha = vocab_alpha
+        self.min_len = min_len
+        self.len_beta = len_beta
+        self.prompt = prompt
+        # self.prompt_cache = None
+        self.prompt_cache = self.model(self.prompt.cuda(), use_cache=True).past_key_values
+
+
+    def score(self, input_batch, skip_first, solution_len):
+        # self.model.eval()
+        #logprob = self.model(input_batch).logits[:,:-1].log_softmax(-1)
+        #token_ids = input_batch[:, 1:].unsqueeze(-1)
+        #logPF = logprob.gather(-1, token_ids).squeeze(-1)
+        # self.model.train()
+        #return logPF[:, self.skip_first-1:].sum(dim=-1) * (1./self.temperature)
+        lora_to_base(self.model)
+        with torch.no_grad():
+            res = score_fast(self.model,
+                            input_batch,
+                            self.eos_token_id,
+                            skip_first=skip_first,
+                            solution_len=solution_len,
+                            solution_beta=self.solution_beta,
+                            vocab_nice_mask=self.vocab_nice_mask,
+                            vocab_naughty_mask=self.vocab_naughty_mask,
+                            vocab_alpha=self.vocab_alpha,
+                            min_len=self.min_len,
+                            len_beta=self.len_beta, 
+                            prompt_cache=(self.prompt.cuda(), self.prompt_cache)) * (1./self.temperature)
+        base_to_lora(self.model)
+        return res
+
+
+class FrozenModel(Reward):
+    def __init__(self, model, eos_token_id, temperature=1., min_len=0, vocab_alpha=-50.,
+                 solution_beta=1., cot_beta=1., vocab_nice_mask=None, vocab_naughty_mask=None, len_beta=0):
+        self.model = model
+        self.model.eval()
+        self.temperature = temperature
+        self.eos_token_id = eos_token_id
+        self.solution_beta = solution_beta
+        self.cot_beta = cot_beta
+        self.vocab_nice_mask = vocab_nice_mask
+        self.vocab_naughty_mask = vocab_naughty_mask
+        self.vocab_alpha = vocab_alpha
+        self.min_len = min_len
+        self.len_beta = len_beta
+    def score(self, input_batch, skip_first, solution_len):
+        # self.model.eval()
+        #logprob = self.model(input_batch).logits[:,:-1].log_softmax(-1)
+        #token_ids = input_batch[:, 1:].unsqueeze(-1)
+        #logPF = logprob.gather(-1, token_ids).squeeze(-1)
+        # self.model.train()
+        #return logPF[:, self.skip_first-1:].sum(dim=-1) * (1./self.temperature)
+        lora_to_base(self.model)
+        with torch.no_grad():
+            res = score_fast(self.model,
+                            input_batch,
+                            self.eos_token_id,
+                            skip_first=skip_first,
+                            solution_len=solution_len,
+                            solution_beta=self.solution_beta,
+                            cot_beta=self.cot_beta,
+                            vocab_nice_mask=self.vocab_nice_mask,
+                            vocab_naughty_mask=self.vocab_naughty_mask,
+                            vocab_alpha=self.vocab_alpha,
+                            min_len=self.min_len,
+                            len_beta=self.len_beta) * (1./self.temperature)
+        base_to_lora(self.model)
+        return res
+
+def load_reward(config, model, tokenizer, dataset, min_len=0):
+    if config.impose_vocab_constraint:
+        def check_str(string, allow_char_set):
+            return all([c in allow_char_set for c in string])
+
+        allowed_indices = torch.tensor([item[1] for item in sorted(tokenizer.vocab.items(), key=lambda x: x[1]) if check_str(item[0], '▁Ġ,.1234567890=+-')], device='cuda', dtype=torch.long)
+        vocab_nice_list = torch.zeros(len(tokenizer.vocab), device='cuda').bool()
+        vocab_nice_list[allowed_indices] = True
+        vocab_nice_list[tokenizer.eos_token_id] = True
+    else: 
+        vocab_nice_list = None
+
+    rew_config = OmegaConf.to_container(config.reward_config, resolve=True)
+    rew_config["model"] = model
+    rew_config["eos_token_id"] = tokenizer.eos_token_id
+    rew_config["min_len"] = min_len
+    rew_config["vocab_nice_mask"] = vocab_nice_list
+
+    if config.reward_name=="FrozenModelWithPrompt" and "prompt_data" in rew_config:
+        data_path = to_absolute_path(config.reward_config.prompt_data.path)
+        data = json.load(open(data_path, 'r'))
+        train_queries = []
+        train_rationales = []
+        train_sols = []
+        for sample in data:
+            train_queries.append(sample['str_query'])
+            train_rationales.append(sample['str_rationale'])
+            train_sols.append(sample['str_sol'])
+        rew_config.pop("prompt_data")
+        prompt_text = '\n'.join([train_queries[i]+ " " + train_rationales[i]+train_sols[i] for i in range(config.reward_config.prompt_data.num_points)]) + '\n'
+        print("Prompt text: ", prompt_text)
+        rew_config["prompt"] = tokenizer(prompt_text, return_tensors='pt')['input_ids'].cuda()
+    
+    elif config.reward_name=="FrozenModelWithPrompt":
+        rew_config["prompt"] = tokenizer(rew_config["prompt"], return_tensors='pt')['input_ids'].cuda()
+    
+    rew = get_reward([config.reward_name], [rew_config])
+    return rew, vocab_nice_list
+File Path: infill_subj_arithmetic/sft.py
+Content:
+from dataclasses import dataclass, field
+from typing import Optional
+
+import torch
+from accelerate import Accelerator
+from datasets import load_dataset
+from peft import LoraConfig
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, BitsAndBytesConfig, HfArgumentParser, TrainingArguments
+
+from trl import SFTTrainer
+
+tqdm.pandas()
+
+# class ArithmeticDataset(torch.utils.data.Dataset):
+
+# Define and parse arguments.
+@dataclass
+class ScriptArguments:
+    model_name: Optional[str] = field(default="gpt2-large", metadata={"help": "the model name"})
+    dataset_path: Optional[str] = field(
+        default="data/stories_sft.csv", metadata={"help": "the dataset name"}
+    )
+    dataset_text_field: Optional[str] = field(default="text", metadata={"help": "the text field of the dataset"})
+    log_with: Optional[str] = field(default=None, metadata={"help": "use 'wandb' to log with wandb"})
+    learning_rate: Optional[float] = field(default=1e-4, metadata={"help": "the learning rate"})
+    batch_size: Optional[int] = field(default=32, metadata={"help": "the batch size"})
+    seq_length: Optional[int] = field(default=128, metadata={"help": "Input sequence length"})
+    gradient_accumulation_steps: Optional[int] = field(
+        default=32, metadata={"help": "the number of gradient accumulation steps"}
+    )
+    load_in_8bit: Optional[bool] = field(default=False, metadata={"help": "load the model in 8 bits precision"})
+    load_in_4bit: Optional[bool] = field(default=False, metadata={"help": "load the model in 4 bits precision"})
+    use_peft: Optional[bool] = field(default=False, metadata={"help": "Wether to use PEFT or not to train adapters"})
+    trust_remote_code: Optional[bool] = field(default=True, metadata={"help": "Enable `trust_remote_code`"})
+    output_dir: Optional[str] = field(default="output", metadata={"help": "the output directory"})
+    peft_lora_r: Optional[int] = field(default=64, metadata={"help": "the r parameter of the LoRA adapters"})
+    peft_lora_alpha: Optional[int] = field(default=16, metadata={"help": "the alpha parameter of the LoRA adapters"})
+    logging_steps: Optional[int] = field(default=1, metadata={"help": "the number of logging steps"})
+    use_auth_token: Optional[bool] = field(default=True, metadata={"help": "Use HF auth token to access the model"})
+    num_train_epochs: Optional[int] = field(default=50, metadata={"help": "the number of training epochs"})
+    max_steps: Optional[int] = field(default=-1, metadata={"help": "the number of training steps"})
+    save_steps: Optional[int] = field(
+        default=100, metadata={"help": "Number of updates steps before two checkpoint saves"}
+    )
+    save_total_limit: Optional[int] = field(default=10, metadata={"help": "Limits total number of checkpoints."})
+    push_to_hub: Optional[bool] = field(default=False, metadata={"help": "Push the model to HF Hub"})
+    hub_model_id: Optional[str] = field(default=None, metadata={"help": "The name of the model on HF Hub"})
+
+
+parser = HfArgumentParser(ScriptArguments)
+script_args = parser.parse_args_into_dataclasses()[0]
+
+# Step 1: Load the model
+if script_args.load_in_8bit and script_args.load_in_4bit:
+    raise ValueError("You can't load the model in 8 bits and 4 bits at the same time")
+elif script_args.load_in_8bit or script_args.load_in_4bit:
+    quantization_config = BitsAndBytesConfig(
+        load_in_8bit=script_args.load_in_8bit, load_in_4bit=script_args.load_in_4bit
+    )
+    # Copy the model to each device
+    device_map = {"": Accelerator().local_process_index}
+    torch_dtype = torch.bfloat16
+else:
+    device_map = None
+    quantization_config = None
+    torch_dtype = None
+
+model = AutoModelForCausalLM.from_pretrained(
+    script_args.model_name,
+    quantization_config=quantization_config,
+    device_map=device_map,
+    trust_remote_code=script_args.trust_remote_code,
+    torch_dtype=torch_dtype,
+    use_auth_token=script_args.use_auth_token,
+)
+
+
+dataset = load_dataset("csv", data_files=script_args.dataset_path)["train"]
+
+# Step 3: Define the training arguments
+training_args = TrainingArguments(
+    output_dir=script_args.output_dir,
+    per_device_train_batch_size=script_args.batch_size,
+    gradient_accumulation_steps=script_args.gradient_accumulation_steps,
+    learning_rate=script_args.learning_rate,
+    logging_steps=script_args.logging_steps,
+    num_train_epochs=script_args.num_train_epochs,
+    max_steps=script_args.max_steps,
+    report_to=script_args.log_with,
+    save_steps=script_args.save_steps,
+    save_total_limit=script_args.save_total_limit,
+    push_to_hub=script_args.push_to_hub,
+    hub_model_id=script_args.hub_model_id,
+)
+
+# Step 4: Define the LoraConfig
+if script_args.use_peft:
+    peft_config = LoraConfig(
+        r=script_args.peft_lora_r,
+        lora_alpha=script_args.peft_lora_alpha,
+        bias="none",
+        # target_modules=["Wqkv", "out_proj"]
+        task_type="CAUSAL_LM",
+    )
+else:
+    peft_config = None
+
+# Step 5: Define the Trainer
+trainer = SFTTrainer(
+    model=model,
+    args=training_args,
+    max_seq_length=script_args.seq_length,
+    train_dataset=dataset,
+    dataset_text_field=script_args.dataset_text_field,
+    peft_config=peft_config,
+)
+
+trainer.train()
+
+# Step 6: Save the model
+trainer.save_model(script_args.output_dir)
+
+File Path: infill_subj_arithmetic/utils.py
+Content:
+from collections import Counter
+import torch
+from torch.distributions import Categorical
+import math
+import re
+from tqdm import tqdm
+
+def lora_to_base(model):
+    try:
+        model.base_model.disable_adapter_layers()
+    except:
+        print("No adapter layers to disable")
+    model.eval()
+    
+def base_to_lora(model):
+    try:
+        model.base_model.enable_adapter_layers()
+    except:
+        print("No adapter layers to enable")
+    model.train()
+
+def get_limited_expr(expr, k):
+    tokens = re.split('(-?\d+)', expr)
+    
+    if k > len(tokens)/2:
+        return expr
+
+    operands = tokens[1::2]
+    if len(operands) <= k:
+        return expr
+
+    operators = tokens[::2]
+    if k > 1:
+        operators = operators[:-1]
+
+    end_operands = operands[-k:]
+    if k > 1:
+        end_operators = operators[-(k-1):]
+    else: 
+        end_operators = []
+
+    end_expr = ''
+    for i in range(len(end_operands)):
+        if i > 0:
+            end_expr += end_operators[i-1]  
+            end_expr += end_operands[i]
+
+    return end_expr
+
+def generate(model, encoded_prompt, eos_token_id, max_len=10, temperature=1., vocab_nice_mask=None,
+                                    vocab_naughty_mask=None, vocab_alpha=-99, top_k=999999, top_p=1., tokenizer=None, use_tools=False,
+                                    limit_capability=0, operators=None, use_cache=True):
+    active_seqs = torch.ones(encoded_prompt.size(0)).bool().to(encoded_prompt.device)
+    logPF = encoded_prompt.new_zeros(encoded_prompt.size(0)).float()
+    actions = encoded_prompt.clone()
+    state = encoded_prompt.clone()
+    if use_cache:
+        past_key_values = model(state[:, :-1])['past_key_values']
+    if use_tools:
+        EQUAL_TOKS = [tokenizer.encode(" =")[-1], tokenizer.encode("=")[-1]]
+    for i in range(max_len):
+        if use_tools and i > 0:
+            if use_cache and past_key_values is not None:
+                output = model(state[:, -1:], attention_mask=state != eos_token_id, past_key_values=past_key_values)
+            else:
+                output = model(state, attention_mask=state != eos_token_id, position_ids=pos)
+        else:
+            if use_cache and not use_tools:
+                output = model(state[:, -1:], past_key_values=past_key_values)
+            else:
+                output = model(state)
+        if use_cache:
+            past_key_values = output['past_key_values']
+        with torch.no_grad():
+            prob = (output['logits'][:, -1, :]).softmax(dim=-1)
+            modified_logits = output['logits'][:, -1, :].clone()
+            # implement top-k by getting the top-k largest values and setting the rest to 0
+            if top_k < 999999:
+                modified_logits[prob >= prob.topk(top_k)] = -float('inf')
+            # implement top-p by getting indices in the top-p prob mass and setting the rest to 0
+            if top_p < 1.:
+                sorted_probs, indices = torch.sort(prob, dim=-1, descending=True)
+                cumsum_prob = torch.cumsum(sorted_probs, dim=-1)
+                nucleus = cumsum_prob < top_p
+                nucleus = torch.cat([nucleus.new_ones(nucleus.shape[:-1] + (1,)), nucleus[..., :-1]], dim=-1)
+                modified_logits[~nucleus] = -float('inf')
+            if vocab_nice_mask is not None:
+                # add vocab_alpha to the logits of the unmasked vocab items
+                modified_logits[:, ~vocab_nice_mask] += vocab_alpha
+            prob = (modified_logits/temperature).softmax(dim=-1)
+            token_ids = torch.multinomial(prob, num_samples=1)
+        logprob = output['logits'][:, -1, :].log_softmax(dim=-1)
+        logPF += logprob.gather(-1, token_ids).squeeze(-1)
+        actions = torch.cat([actions, token_ids], dim=-1)
+        state = torch.cat([state, token_ids], dim=-1)
+        if use_tools:
+            tool_used=False
+            new_str = []
+            for j, tok in enumerate(token_ids):
+                if tok[0].item() in EQUAL_TOKS:
+                    expr = tokenizer.batch_decode(remove_left_pad([state[j]], eos_token_id, eos_token_id))[0]
+                    to_eval = expr.split("Answer:")[-1].split(',')[-1].split(".")[-1].split('=')[0]
+                    if limit_capability > 1 and to_eval!="":
+                        to_eval = get_limited_expr(to_eval, limit_capability)
+                    try:
+                        val = eval(to_eval)
+                        tool_used=True
+                    except:
+                        new_str.append(state[j])
+                        continue
+                    new_str.append(torch.cat((state[j], tokenizer.batch_encode_plus([" " + str(val)], return_tensors='pt')['input_ids'].cuda()[0])))
+                else:
+                    new_str.append(state[j])
+            state, pos, _ = left_pad(remove_left_pad(new_str, eos_token_id, eos_token_id, False), eos_token_id, eos_token_id)
+            state = state.cuda()
+            pos = pos.cuda()
+            if tool_used:
+                past_key_values = None
+        # check if all sequences have generated eos
+        active_seqs = active_seqs * (token_ids != eos_token_id).squeeze(-1)
+        if torch.all(~active_seqs):
+            break
+    return actions, logPF, remove_left_pad(state, eos_token_id, eos_token_id)
+
+def generate_and_return_eos_logprob(model, encoded_prompt, eos_token_id, reward_fn, vocab_nice_mask=None,
+                                    vocab_naughty_mask=None, vocab_alpha=-99, max_len=10, min_len=0,
+                                    temperature=1., top_k=999999, top_p=1., action_seq=None, skip_rewards=False,
+                                    tokenizer=None, use_tools=False, limit_capability=0, operators=None, use_cache=True):
+    # generate and return the probability of generating eos at every step
+    active_seqs = torch.ones(encoded_prompt.size(0)).bool().to(encoded_prompt.device)
+    actions = encoded_prompt.clone()
+    state = encoded_prompt.clone()
+    logpf = encoded_prompt.new_zeros(encoded_prompt.size(0), max_len+1).float()
+    logeosprobs = encoded_prompt.new_zeros(encoded_prompt.size(0), max_len+1).float()
+    logrewards = encoded_prompt.new_zeros(encoded_prompt.size(0), max_len+1).float()
+    if use_cache:
+        past_key_values = model(state[:, :-1])['past_key_values']
+    if use_tools:
+        EQUAL_TOKS = [tokenizer.encode(" =")[-1], tokenizer.encode("=")[-1]]
+    if not skip_rewards:
+        logrewards[:, 0] = reward_fn(state)
+    for i in range(max_len):
+        if use_tools and i > 0:
+            if use_cache and past_key_values is not None:
+                output = model(state[:, -1:], attention_mask=state != eos_token_id, past_key_values=past_key_values)
+            else:
+                output = model(state, attention_mask=state != eos_token_id, position_ids=pos)
+        else:
+            if use_cache and not use_tools:
+                output = model(state[:, -1:], past_key_values=past_key_values)
+            else:
+                output = model(state)
+        if use_cache:
+            past_key_values = output['past_key_values']
+        if action_seq is None:
+            with torch.no_grad():
+                prob = (output['logits'][:, -1, :]).softmax(dim=-1)
+                modified_logits = output['logits'][:, -1, :].clone().detach()
+                # implement top-k by getting the top-k largest values and setting the rest to 0
+                if top_k < 999999:
+                    modified_logits[prob >= prob.topk(top_k)] = -float('inf')
+                # implement top-p by getting indices in the top-p prob mass and setting the rest to 0
+                if top_p < 1.:
+                    sorted_probs, indices = torch.sort(prob, dim=-1, descending=True)
+                    cumsum_prob = torch.cumsum(sorted_probs, dim=-1)
+                    nucleus = cumsum_prob < top_p
+                    nucleus = torch.cat([nucleus.new_ones(nucleus.shape[:-1] + (1,)), nucleus[..., :-1]], dim=-1)
+                    modified_logits[~nucleus] = -float('inf')
+                # if we haven't reach the minimum length, set the probability of generating eos to 0
+                if i < min_len:
+                    modified_logits[:, eos_token_id] = -float('inf')
+                if vocab_nice_mask is not None:
+                    # add vocab_alpha to the logits of the unmasked vocab items
+                    modified_logits[:, ~vocab_nice_mask] += vocab_alpha
+                prob = (modified_logits/temperature).softmax(dim=-1)
+                token_ids = torch.multinomial(prob, num_samples=1)
+        else:
+            if i >= action_seq.size(-1):
+                token_ids = (torch.ones_like(action_seq[:, 0]) * eos_token_id).unsqueeze(-1)
+            else:
+                token_ids = action_seq[:, i].unsqueeze(-1)
+        token_ids = torch.where(active_seqs.unsqueeze(-1), token_ids, torch.ones_like(token_ids) * eos_token_id)
+        modified_logits = output['logits'][:, -1, :]
+        if vocab_nice_mask is not None:
+            modified_logits[:, ~vocab_nice_mask] += vocab_alpha
+        logprob = modified_logits.log_softmax(dim=-1)
+        #print(logprob[0, eos_token_id])
+        #print(logprob.shape, token_ids.shape)
+        #print(logprob.shape, encoded_prompt.shape)
+        #print(actions.shape, output['logits'].shape)
+        logpf[:, i] = torch.where(active_seqs, logprob.gather(-1, token_ids).squeeze(-1), 0)
+        logeosprobs[:, i] = torch.where(active_seqs, logprob[:, eos_token_id], 0)
+        actions = torch.cat([actions, token_ids], dim=-1)
+        state = torch.cat([state, token_ids], dim=-1)
+        if use_tools:
+            tool_used=False
+            new_str = []
+            for j, tok in enumerate(token_ids):
+                if tok[0].item() in EQUAL_TOKS:
+                    # import pdb; pdb.set_trace();
+                    expr = tokenizer.batch_decode(remove_left_pad([state[j]], eos_token_id, eos_token_id))[0]
+                    to_eval = expr.split("Answer:")[-1].split(',')[-1].split(".")[-1].split('=')[0]
+                    if limit_capability > 1 and to_eval!="":
+                        to_eval = get_limited_expr(to_eval, limit_capability)
+                    try:
+                        val = eval(to_eval)
+                        tool_used=True
+                    except:
+                        new_str.append(state[j])
+                        continue
+                        # raise ValueError(f'Failed to evaluate {to_eval}')
+                    # new_str.append(expr + " " + str(val))
+                    new_str.append(torch.cat((state[j], tokenizer.batch_encode_plus([" " + str(val)], return_tensors='pt')['input_ids'].cuda()[0])))
+                    # new_str.append(tokenizer.batch_encode_plus([expr + " " + str(val)], return_tensors='pt')['input_ids'].cuda()[0])
+                else:
+                    new_str.append(state[j])
+            state, pos, _ = left_pad(remove_left_pad(new_str, eos_token_id, eos_token_id, False), eos_token_id, eos_token_id)
+            state = state.cuda()
+            pos = pos.cuda()
+            if tool_used:
+                past_key_values = None
+            # state = tokenizer.batch_encode_plus(new_str, return_tensors='pt')['input_ids'].cuda()
+        if not skip_rewards:
+            if use_tools:
+                logrewards[:, i+1] = torch.where(active_seqs, reward_fn(remove_left_pad(state, eos_token_id, eos_token_id)), 0)
+            else:
+                logrewards[:, i+1] = torch.where(active_seqs, reward_fn(actions), 0)
+        # check if all sequences have generated eos
+        active_seqs = active_seqs * (token_ids != eos_token_id).squeeze(-1)
+        if torch.all(~active_seqs):
+            break
+    # add eos to the end of the sequence
+    actions = torch.cat([actions, actions.new_ones(actions.size(0), 1)*eos_token_id], dim=-1)
+    logpf[:, -1] = 0
+    logeosprobs[:, -1] = 0
+    return actions, logpf, logeosprobs, logrewards
+
+def generate_and_return_terminate_logprob_v2(model, encoded_prompt, eos_token_id, reward_fn, vocab_nice_mask=None,
+                                    vocab_alpha=-99, max_len=10, min_len=0, sep_token_id=None, tokenizer=None,
+                                    temperature=1., top_k=999999, top_p=1., action_seq=None, skip_rewards=False):
+    # generate and return the probability of generating eos_token_id on every step
+    active_seqs = torch.ones(encoded_prompt.size(0)).bool().to(encoded_prompt.device)
+    stmt_sets = [set() for _ in range(encoded_prompt.size(0))]
+    cursors = [encoded_prompt.size(1) for _ in range(encoded_prompt.size(0))]
+    new_input = encoded_prompt.clone()
+    logpf = encoded_prompt.new_zeros(encoded_prompt.size(0), max_len+1).float()
+    logeosprobs = encoded_prompt.new_zeros(encoded_prompt.size(0), max_len+1).float()
+    logrewards = encoded_prompt.new_zeros(encoded_prompt.size(0), max_len+1).float()
+    if not skip_rewards:
+        logrewards[:, 0] = reward_fn(new_input)
+    for i in range(max_len):
+        output = model(new_input)
+        if action_seq is None:
+            with torch.no_grad():
+                prob = (output['logits'][:, -1, :]).softmax(dim=-1)
+                modified_logits = output['logits'][:, -1, :].clone().detach()
+                # implement top-k by getting the top-k largest values and setting the rest to 0
+                if top_k < 999999:
+                    modified_logits[prob >= prob.topk(top_k)] = -float('inf')
+                # implement top-p by getting indices in the top-p prob mass and setting the rest to 0
+                if top_p < 1.:
+                    sorted_probs, _ = torch.sort(prob, dim=-1, descending=True)
+                    cumsum_prob = torch.cumsum(sorted_probs, dim=-1)
+                    nucleus = cumsum_prob < top_p
+                    nucleus = torch.cat([nucleus.new_ones(nucleus.shape[:-1] + (1,)), nucleus[..., :-1]], dim=-1)
+                    modified_logits[~nucleus] = -float('inf')
+                # if we haven't reach the minimum length, set the probability of generating eos to 0
+                if i < min_len:
+                    modified_logits[:, eos_token_id] = -float('inf')
+                if vocab_nice_mask is not None:
+                    # add vocab_alpha to the logits of the unmasked vocab items
+                    modified_logits[:, ~vocab_nice_mask] += vocab_alpha
+                if sep_token_id is not None:
+                    # make sure we don't generate duplicate statements
+                    for j, token_id in enumerate(token_ids):
+                        if token_id == sep_token_id and tuple(new_input[j, cursors[j]:].tolist()) in stmt_sets[j]:
+                            modified_logits[:, eos_token_id] = -float('inf')
+                            modified_logits[:, sep_token_id] = -float('inf')
+                prob = (modified_logits/temperature).softmax(dim=-1)
+                token_ids = torch.multinomial(prob, num_samples=1)
+        else:
+            if i >= action_seq.size(-1):
+                token_ids = (torch.ones_like(action_seq[:, 0]) * eos_token_id).unsqueeze(-1)
+            else:
+                token_ids = action_seq[:, i].unsqueeze(-1)
+        token_ids = torch.where(active_seqs.unsqueeze(-1), token_ids, torch.ones_like(token_ids) * eos_token_id)
+        if sep_token_id is not None:
+            # check if we have generated the separator token
+            for j, token_id in enumerate(token_ids):
+                if token_id == sep_token_id or token_id == eos_token_id:
+                    stmt_sets[j].add(tuple(new_input[j, cursors[j]:].tolist()))
+                    cursors[j] = new_input.size(1) + 1
+                    # replace the corresponding entry in new_input with the sorted sequences from the set
+                    sorted_stmts = tuple([ele for stmt in sorted([x+(sep_token_id,) for x in list(stmt_sets[j])]) for ele in stmt])[:-1]
+                    new_stmts = torch.tensor(sorted_stmts, device=encoded_prompt.device)
+                    #print(tokenizer.batch_decode([new_stmts]))
+                    new_input[j, encoded_prompt.size(1):encoded_prompt.size(1)+new_stmts.size(0)] = new_stmts
+            #print(cursors)
+        modified_logits = output['logits'][:, -1, :]
+        if vocab_nice_mask is not None:
+            modified_logits[:, ~vocab_nice_mask] += vocab_alpha
+        logprob = modified_logits.log_softmax(dim=-1)
+        logpf[:, i] = logprob.gather(-1, token_ids).squeeze(-1)
+        logeosprobs[:, i] = logprob[:, eos_token_id]
+        new_input = torch.cat([new_input, token_ids], dim=-1)
+        if not skip_rewards:
+            logrewards[:, i+1] = torch.where(active_seqs, reward_fn(new_input), 0)
+        # check if all sequences have generated eos
+        active_seqs = active_seqs * (token_ids != eos_token_id).squeeze(-1)
+        if torch.all(~active_seqs):
+            break
+    # add eos to the end of the sequence
+    new_input = torch.cat([new_input, new_input.new_ones(new_input.size(0), 1)*eos_token_id], dim=-1)
+    logpf[:, -1] = 0
+    logeosprobs[:, -1] = 0
+    return new_input, logpf, logeosprobs, logrewards
+
+def score(model, encoded_input, skip_first=1):
+    raise NotImplementedError
+    logPF = 0.
+    for i in range(skip_first, encoded_input.size(-1)):
+        output = model(encoded_input[:, :i])
+        logprob = output['logits'][:, -1, :].log_softmax(dim=-1)
+        token_id = encoded_input[:, i]
+        logPF += logprob.gather(-1, token_id.unsqueeze(-1)).squeeze(-1)
+    return logPF
+
+@torch.no_grad()
+def score_fast(model, encoded_input, eos_token_id, min_len=0,
+               skip_first=1, solution_len=0, solution_beta=1., cot_beta=1.,
+               vocab_nice_mask=None, vocab_naughty_mask=None,
+               vocab_alpha=-99, len_beta=0, reduction='sum', tokenizer=None,
+               prompt_cache=None):
+    if prompt_cache is None:
+        logits = model(encoded_input, attention_mask=encoded_input!=eos_token_id).logits[:,:-1,:]
+    else:
+        # prompt_cache[1] contains past_key_values which need to be reshaped to the right batch size from encoded_input
+        batched_prompt_cache = tuple(tuple([prompt_cache[1][i][j].repeat(encoded_input.shape[0], 1, 1, 1) for j in range(len(prompt_cache[1][i]))]) for i in range(len(prompt_cache[1])))
+        concat_input = torch.cat([prompt_cache[0].repeat(encoded_input.shape[0], 1), encoded_input], dim=-1)
+        attention_mask = concat_input != eos_token_id
+        logits = model(encoded_input, past_key_values=batched_prompt_cache, attention_mask=attention_mask).logits[:,:-1,:]
+    # get rid of the first few tokens
+    logits = logits[:, skip_first-1:]
+    non_eos_mask = (encoded_input != eos_token_id)[:, skip_first:]
+    # score the log probability of the input sequence while ignoring trailing eos
+    if vocab_nice_mask is not None:
+        # add vocab_alpha to the logits of the unmasked vocab items
+        # get a mask for the rationale
+        rat_mask = torch.concat([non_eos_mask[:, solution_len:],
+                                 encoded_input.new_zeros(encoded_input.size(0), solution_len)], dim=-1)
+        #print(tokenizer.batch_decode(encoded_input[:, skip_first:][rat_mask.bool()]))
+        logits[(rat_mask.float().unsqueeze(-1) @ (~vocab_nice_mask).float().unsqueeze(0)).bool()] += vocab_alpha
+        logprob = logits.log_softmax(-1)
+    elif vocab_naughty_mask is not None:
+        # add vocab_alpha to the logits of the masked vocab items
+        # get a mask for the rationale
+        rat_mask = torch.concat([non_eos_mask[:, solution_len:],
+                                 encoded_input.new_zeros(encoded_input.size(0), solution_len)], dim=-1)
+        logits[(rat_mask.float().unsqueeze(-1) @ vocab_naughty_mask.float().unsqueeze(0)).bool()] += vocab_alpha
+        logprob = logits.log_softmax(-1)
+    else:
+        # all the vocab items are allowed
+        logprob = logits.log_softmax(-1)
+    token_ids = encoded_input[:, skip_first:].unsqueeze(-1)
+    logPF = logprob.gather(-1, token_ids).squeeze(-1)
+    #print(tokenizer.batch_decode(token_ids[0]))
+    #print(logPF)
+    #for tok, logp in zip(tokenizer.batch_decode(token_ids[0]), logPF[0]):
+        #pass
+        #print(f'{tok}\t\t{logp.item():.3f}')
+    # change the log probability of eos to 0
+    logPF[encoded_input[:, skip_first:] == eos_token_id] = 0.
+    if (solution_len > 0 and solution_beta != 1.) or cot_beta != 1.:
+        # get a mask for the last solution_len tokens excluding eos
+        mask = torch.concat([(logPF == 0.)[:, solution_len:], logPF.new_ones(logPF.size(0), solution_len)], dim=-1)
+        # get the log probability of the solutions
+        logPF_solution = (logPF*mask).sum(dim=-1)
+        # get the log probability of the chain-of-thought
+        logPF_cot = (logPF*(1-mask)).sum(dim=-1) #* solution_beta
+        logPF_cot = logPF_cot / (non_eos_mask.sum(dim=-1) - solution_len + 1)**len_beta
+        return logPF_solution*(1/solution_beta) + logPF_cot*(1/cot_beta)
+    if reduction == 'sum':
+        res = logPF.sum(dim=-1)
+        res = torch.where((non_eos_mask.sum(dim=-1) - solution_len) < min_len, -99, res)
+    else:
+        res = logPF
+    return res
+
+@torch.no_grad()
+def reward_keywords(model, encoded_input, keywords, reward, skip_first=1, gamma=1.):
+    has_keywords = torch.isin(encoded_input[:, skip_first-1:], keywords).sum(dim=-1).bool()
+    #if torch.any(has_keywords):
+    #    import pdb; pdb.set_trace()
+    return torch.where(has_keywords, reward + math.log(gamma), reward)
+
+
+def append_eos(tokenizer, encoded_input):
+    return torch.cat([encoded_input, encoded_input.new_ones(encoded_input.size(0), 1)*tokenizer.eos_token_id], dim=-1)
+
+def append_seq(tokenizer, encoded_input, to_append):
+    encoded_to_append = tokenizer(to_append, return_tensors='pt')['input_ids'].cuda()
+    return torch.cat([encoded_input, encoded_to_append.repeat(encoded_input.size(0), 1)], dim=-1)
+
+def append_sol_and_remove_eos(text : torch.Tensor, result : torch.Tensor, eos_token_id : int, pad_token_id : int):
+    # remove anything after the first eos token and append the result
+    # if there is no eos token, append the result
+    # text is a torch tensor with the first dimension being the batch
+    # result is a torch tensor with the first dimension being the batch
+    # this is a vectorized implementation
+    # returns a torch tensor with the first dimension being the batch
+    # and the second dimension being the length of the sequence
+    new_text = []
+    for t, r in zip(text, result[:text.size(0)]):
+        if eos_token_id not in t:
+            new_text.append(t if r is None else torch.cat([t, r]))
+            continue
+        # find the first eos token
+        t[(t == eos_token_id).cumsum(dim=-1) >= 1] = eos_token_id
+        eos_ind = ((t == eos_token_id).cumsum(dim=-1) == 1).nonzero()[0]
+        # remove the eos tokens from the result and shift the result to the left
+        if r is not None:
+            new_text.append(torch.cat([t[:eos_ind], r]))
+        else:
+            new_text.append(t[:eos_ind])
+    return torch.nn.utils.rnn.pad_sequence(new_text, batch_first=True, padding_value=pad_token_id)
+
+
+
+def left_pad_generate(model, encoded_prompt, position_ids, eos_token_id, pad_token_id, max_len=10, temperature=1., top_k=999999, top_p=1.):
+    active_seqs = torch.ones(encoded_prompt.size(0)).bool().to(encoded_prompt.device)
+    logPF = encoded_prompt.new_zeros(encoded_prompt.size(0)).float()
+    new_input = encoded_prompt.clone()
+    for _ in range(max_len):
+        output = model(new_input, attention_mask=(new_input != pad_token_id).long(), position_ids=position_ids)
+        with torch.no_grad():
+            prob = (output['logits'][:, -1, :]).softmax(dim=-1)
+            modified_logits = output['logits'][:, -1, :].clone()
+            # implement top-k by getting the top-k largest values and setting the rest to 0
+            if top_k < 999999:
+                modified_logits[prob >= prob.topk(top_k)] = -float('inf')
+            # implement top-p by getting indices in the top-p prob mass and setting the rest to 0
+            if top_p < 1.:
+                sorted_probs, indices = torch.sort(prob, dim=-1, descending=True)
+                cumsum_prob = torch.cumsum(sorted_probs, dim=-1)
+                nucleus = cumsum_prob < top_p
+                nucleus = torch.cat([nucleus.new_ones(nucleus.shape[:-1] + (1,)), nucleus[..., :-1]], dim=-1)
+                modified_logits[~nucleus] = -float('inf')
+            prob = (modified_logits/temperature).softmax(dim=-1)
+            token_ids = torch.multinomial(prob, num_samples=1)
+        logprob = output['logits'][:, -1, :].log_softmax(dim=-1)
+        logPF += logprob.gather(-1, token_ids).squeeze(-1)
+        new_input = torch.cat([new_input, token_ids], dim=-1)
+        position_ids = torch.cat([position_ids, position_ids[:, -1:] + 1], dim=-1)
+        active_seqs = active_seqs * (token_ids != eos_token_id).squeeze(-1)
+        if torch.all(~active_seqs):
+            break
+    return new_input, logPF
+
+
+def remove_eos_and_pad_left(text : torch.Tensor, eos_token_id : int, pad_token_id : int):
+    """
+    remove anything after the first eos token, and left pad sequences"""
+    stripped_text = []
+    lens = []
+    position_ids = []
+    for t in text:
+        if eos_token_id not in t:
+            stripped_text.append(t)
+            position_ids.append(torch.arange(t.size(-1)))
+            lens.append(t.size(-1))
+            continue
+        # find the first eos token
+        t[(t == eos_token_id).cumsum(dim=-1) >= 1] = eos_token_id
+        eos_ind = ((t == eos_token_id).cumsum(dim=-1) == 1).nonzero()[0]
+        stripped_text.append(t[:eos_ind])
+        lens.append(eos_ind)
+        position_ids.append(torch.arange(eos_ind.item()))
+    left_pad_seqs = torch.nn.utils.rnn.pad_sequence([i.flip(0) for i in stripped_text], batch_first=True, padding_value=pad_token_id).flip(dims=[1]) 
+    left_pad_position_ids = torch.nn.utils.rnn.pad_sequence([i.flip(0) for i in position_ids], batch_first=True, padding_value=0).flip(dims=[1])
+    return left_pad_seqs, left_pad_position_ids, torch.tensor(lens)
+
+def left_pad(text : torch.Tensor, eos_token_id : int, pad_token_id : int):
+    stripped_text = []
+    lens = []
+    position_ids = []
+    for t in text:
+        # if eos_token_id not in t:
+        stripped_text.append(t)
+        
+        position_ids.append(torch.arange(t[(t != eos_token_id).cumsum(dim=-1) >= 1].size(-1)))
+        lens.append(t.size(-1))
+
+    left_pad_seqs = torch.nn.utils.rnn.pad_sequence([i.flip(0) for i in stripped_text], batch_first=True, padding_value=pad_token_id).flip(dims=[1]) 
+    left_pad_position_ids = torch.nn.utils.rnn.pad_sequence([i.flip(0) for i in position_ids], batch_first=True, padding_value=0).flip(dims=[1])
+    return left_pad_seqs, left_pad_position_ids, torch.tensor(lens)
+
+
+def remove_left_pad(text : torch.Tensor, eos_token_id : int, pad_token_id : int, return_padded: bool = True):
+    """
+    remove left padding and pad to the right"""
+    stripped_text = []
+    for t in text:
+        # t[(t != eos_token_id).cumsum(dim=-1) >= 1] = eos_token_id
+        # neos_ind = ((t != eos_token_id).cumsum(dim=-1) == 1).nonzero()[0]
+        stripped_text.append(t[(t != eos_token_id).cumsum(dim=-1) >= 1])
+        # stripped_text.append(torch.cat([t[-l:], t.new_ones(t.size(0), t.size(1)-l)*pad_token_id], dim=-1))
+    # print(stripped_text)
+    if return_padded:
+        return torch.nn.utils.rnn.pad_sequence(stripped_text, batch_first=True, padding_value=pad_token_id)
+    else:
+        return stripped_text
+
+def extract_answer(str_answer):
+    try:
+        try:
+            extracted_answer = int(str_answer.split('=')[-1].strip().strip('.'))
+        except:
+            extracted_answer = int(str_answer.split()[-1].strip().strip('.'))
+    except:
+        extracted_answer = -1
+    return extracted_answer
+
+def check_answer(str_answer, num_sol):
+    extracted_answer = extract_answer(str_answer)
+    if num_sol == extracted_answer:
+        return True
+    return False
+
+def run_evaluation(model, tokenizer, encoded_test_queries, test_num_sols, eos_token_id, pad_token_id, vocab_nice_list, max_eval_len, num_samples, use_tools, limit_capability=0, operators=None, use_cache=True):
+    base_to_lora(model)
+    model.eval()
+    test_correct = 0
+    test_total = 0
+    incorrect_answers = []
+    for query_ind in tqdm(range(len(encoded_test_queries))):
+        encoded_input = encoded_test_queries[query_ind]
+        with torch.no_grad():
+            generated_text, _, full_state = generate(model,
+                                    encoded_input.repeat(num_samples, 1),
+                                    eos_token_id=eos_token_id,
+                                    vocab_nice_mask=vocab_nice_list,
+                                    max_len=max_eval_len,
+                                    temperature=.1,
+                                    tokenizer=tokenizer,
+                                    use_tools=use_tools,
+                                    limit_capability=limit_capability,
+                                    operators=operators,
+                                    use_cache=use_cache)
+        decoded_answers = tokenizer.batch_decode(append_sol_and_remove_eos(full_state if use_tools else generated_text, [None,] * generated_text.size(0), eos_token_id, pad_token_id))
+        extracted_answers = [extract_answer(i) for i in decoded_answers]
+        answer = Counter(extracted_answers).most_common(1)[0][0]
+        # if check_answer(decoded_answer, test_num_sols[query_ind]):
+        if answer == test_num_sols[query_ind]:
+            test_correct += 1
+        else:
+            incorrect_answers.append(decoded_answers)
+        test_total += 1
+        # print(decoded_answer)
+    return test_correct / test_total, incorrect_answers
+
+File Path: next_sentence/data/openwebtext/data_generator.py
+Content:
+from datasets import load_dataset
+import re
+import nltk
+import pycld2 as cld2
+import pandas as pd
+from tqdm import tqdm
+import random
+from transformers import GPT2Tokenizer
+import seaborn as sns
+from matplotlib import pyplot as plt
+
+num_examples = 10000
+min_tokens_per_sentence = 5
+max_tokens_per_sentence = 30
+prompt_sentence_len = (1, 3)
+prompt_sentence_len_probs = [0.2, 0.3, 0.5]
+
+random.seed(27)
+nltk.download("popular")
+dataset = load_dataset("Skylion007/openwebtext")["train"]
+data_indices = list(range(len(dataset)))
+random.shuffle(data_indices)
+tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+
+prompts = []
+stats = []
+pbar = tqdm(total=num_examples)
+for data_idx in data_indices:
+    passage = dataset[data_idx]["text"].strip()
+    passage = nltk.sent_tokenize(passage)
+
+    # Number of sentences must be in allowed range + a plausible next sampled sentence
+    if len(passage) < prompt_sentence_len[1] + 1:
+        continue
+
+    # Pick a number of sentences to use
+    num_sentences = random.choices(
+        range(prompt_sentence_len[0], prompt_sentence_len[1] + 1),
+        weights=prompt_sentence_len_probs,
+        k=1,
+    )[0]
+
+    # Find num_sentences that meets the criteria, searching in random order
+    start_idx = list(range(0, len(passage) - num_sentences))
+    random.shuffle(start_idx)
+    for idx in start_idx:
+        prompt = passage[idx : idx + num_sentences]
+
+        # Check sentence token length bounds
+        prompt_tokens = tokenizer(prompt)["input_ids"]
+        if any(len(tokens) > max_tokens_per_sentence for tokens in prompt_tokens):
+            continue
+        if any(len(tokens) < min_tokens_per_sentence for tokens in prompt_tokens):
+            continue
+
+        # Convert from list of sentences back to one string
+        prompt = " ".join(prompt) + " "
+
+        # Check sentence only uses normal characters
+        if not re.match("^[a-zA-Z0-9,.!? ]*$", prompt):
+            continue
+
+        # Check sentence is in English
+        isReliable, _, details = cld2.detect(prompt)
+        if not isReliable or details[0][1] != "en":
+            continue
+
+        break
+
+    # If no prompt met all the criteria, continue to the next passage
+    if idx == start_idx[-1]:
+        continue
+
+    prompts.append(prompt)
+    stats.append(
+        {
+            "num_sentences": num_sentences,
+            "num_tokens": sum(len(tokens) for tokens in prompt_tokens),
+        }
+    )
+    pbar.update(1)
+    if len(prompts) == num_examples:
+        break
+pbar.close()
+stats = pd.DataFrame(stats)
+
+with open("data/openwebtext/prompts.txt", "w") as f:
+    f.write("\n".join(prompts))
+
+fig, axs = plt.subplots(1, 2, figsize=(10, 5))
+sns.countplot(stats, x="num_sentences", color=sns.color_palette()[0], ax=axs[0])
+axs[0].set_title("Number of Sentences")
+sns.histplot(stats, x="num_tokens", ax=axs[1])
+axs[1].set_title("Number of Tokens")
+fig.tight_layout()
+fig.savefig("data/openwebtext/prompts_stats.png")
+
+File Path: next_sentence/lightning_data.py
+Content:
+from torch.utils.data import DataLoader
+from torchdata.datapipes.map import MapDataPipe
+from pytorch_lightning import LightningDataModule
+import warnings
+
+warnings.filterwarnings("ignore", ".*does not have many workers.*")
+
+
+class PromptDataModule(LightningDataModule):
+    def __init__(
+        self,
+        data_path,
+        tokenizer,
+        train_size=0.95,
+        limit_prompts=None,
+    ):
+        super().__init__()
+        self.save_hyperparameters(ignore="tokenizer")
+        self.tokenizer = tokenizer
+        self.train_data = None
+        self.val_data = None
+
+    def setup(self, stage):
+        with open(self.hparams.data_path, "r") as f:
+            prompts = f.readlines()
+        prompts = [line.rstrip("\n") for line in prompts]
+        if self.hparams.limit_prompts is not None:
+            prompts = prompts[: self.hparams.limit_prompts]
+        num_train = int(len(prompts) * self.hparams.train_size)
+        self.train_data = PromptDataPipe(prompts[:num_train], self.tokenizer)
+        self.val_data = PromptDataPipe(prompts[num_train:], self.tokenizer)
+
+    def train_dataloader(self):
+        return DataLoader(self.train_data, shuffle=True, batch_size=None, num_workers=0)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_data, batch_size=None, num_workers=0)
+
+
+class PromptDataPipe(MapDataPipe):
+    def __init__(self, prompts, tokenizer) -> None:
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.prompts = prompts
+
+    def __len__(self):
+        return len(self.prompts)
+
+    def __getitem__(self, index):
+        prompt = self.tokenizer(
+            self.prompts[index],
+            return_tensors="pt",
+        )["input_ids"]
+        return prompt
+
+File Path: next_sentence/lightning_module.py
+Content:
+import random
+from functools import partial
+import pandas as pd
+import numpy as np
+import torch
+from pytorch_lightning import LightningModule
+from utils import (
+    generate_and_return_termination_logprob,
+    modified_subtb_loss,
+    get_termination_vals,
+    SequenceDiversity,
+)
+from utils import lora_to_base, base_to_lora
+
+
+class NextSentenceGFNTask(LightningModule):
+    def __init__(
+        self,
+        model,
+        tokenizer,
+        reward,
+        reward_buffer,
+        n_samples,
+        lr,
+        subtb_lambda,
+        pf_temp_high,
+        pf_temp_low,
+        pf_temp_prob,
+        use_buffer_prob,
+        min_sentence_len,
+        max_sentence_len,
+        reward_temp_start,
+        reward_temp_end,
+        reward_temp_horizon,
+        illegal_token_mask,
+        train_probes=None,
+        val_probes=None,
+        diversity_metric=None,
+        use_4bit=False,
+    ):
+        super().__init__()
+        self.save_hyperparameters(ignore=["model", "tokenizer"])
+
+        self.model = model
+        self.tokenizer = tokenizer
+        self.reward = reward
+        self.reward_buffer = reward_buffer
+
+        self.diversity_metric_name = f"diversity ({diversity_metric})"
+        self.diversity_metric = SequenceDiversity(diversity_metric)
+
+        self.get_lr_at_step = lambda step: min(step / 20 * lr, lr)
+        self.get_reward_temp_at_step = lambda step: reward_temp_start + (
+            reward_temp_end - reward_temp_start
+        ) * min(1, step / reward_temp_horizon)
+
+        try:  # Some tokenizers encode a "." differently when it is the first token
+            self.end_of_sentence_token_id = tokenizer.encode(
+                "A sentence.", add_special_tokens=False
+            )[-1]
+        except:
+            self.end_of_sentence_token_id = tokenizer.convert_tokens_to_ids(".")
+
+    def forward(self, prompt, n_samples=None, pf_temperature=1.0, action_seq=None):
+        assert prompt.ndim == 1
+        n_samples = self.hparams.n_samples if n_samples is None else n_samples
+        prompt = prompt.unsqueeze(0).expand(n_samples, -1)
+        reward_fn = partial(
+            self.reward.score,
+            prompt_length=prompt.shape[1],
+            model=self.model,
+            tokenizer=self.tokenizer,
+        )
+        (
+            generated_text,
+            log_pf,
+            log_pterm,
+            log_r,
+            log_r_unpenalized,
+        ) = generate_and_return_termination_logprob(
+            self.model,
+            prompt,
+            reward_fn=reward_fn,
+            termination_token_id=self.end_of_sentence_token_id,
+            vocab_naughty_mask=self.hparams.illegal_token_mask,
+            min_len=self.hparams.min_sentence_len,
+            max_len=self.hparams.max_sentence_len,
+            temperature=pf_temperature,
+            skip_rewards=False,
+            action_seq=action_seq,
+        )
+        return generated_text, log_pf, log_pterm, log_r, log_r_unpenalized
+
+    def training_step(self, prompt, batch_idx):
+        # Should always be (1, prompt_len)
+        prompt = prompt[0]
+
+        # Sample a sentence and get the reward
+        if (
+            random.random() < self.hparams.use_buffer_prob
+            and self.reward_buffer.sample(self.hparams.n_samples, prompt)[0] is not None
+        ):
+            # Using a sample from the reward buffer
+            action_seq, log_r = self.reward_buffer.sample(
+                self.hparams.n_samples, prompt
+            )
+            generated_text, log_pf, log_pterm, _, log_r_unpenalized = self.forward(
+                prompt, action_seq=action_seq
+            )
+            log_r = log_r[
+                :, : generated_text.shape[1] - len(prompt)
+            ]  # Undo padding from buffer
+            log_r *= 1 / self.reward.temperature  # redo the effect of reward tempering
+        else:
+            # Using the forward policy
+            if random.random() < self.hparams.pf_temp_prob:  # With tempering
+                pf_temp = (
+                    random.random()
+                    * (self.hparams.pf_temp_high - self.hparams.pf_temp_low)
+                    + self.hparams.pf_temp_low
+                )
+            else:  # Without tempering
+                pf_temp = 1.0
+            generated_text, log_pf, log_pterm, log_r, log_r_unpenalized = self.forward(
+                prompt, pf_temperature=pf_temp
+            )
+            self.reward_buffer.add_batch(
+                prompt=prompt,
+                sentences=generated_text[:, len(prompt) :],
+                logrewards=log_r
+                * self.reward.temperature,  # undo the effect of reward tempering
+                tokenizer=self.tokenizer,
+            )
+
+        # Get the GFN loss
+        loss = modified_subtb_loss(
+            log_pf=log_pf,
+            log_r=log_r,
+            log_pterm=log_pterm,
+            generated_text=generated_text,
+            termination_token_id=self.end_of_sentence_token_id,
+            prompt_len=len(prompt),
+            subtb_lambda=self.hparams.subtb_lambda,
+        )
+
+        # Log metrics
+        _, last_log_r, last_log_r_unpenalized, sentence_len = get_termination_vals(
+            generated_text=generated_text,
+            log_pf=log_pf,
+            log_pterm=log_pterm,
+            log_r=log_r,
+            log_r_unpenalized=log_r_unpenalized,
+            termination_token_id=self.end_of_sentence_token_id,
+            prompt_len=len(prompt),
+        )
+        log_ps = last_log_r * self.reward.temperature
+        log_ps_unpenalized = last_log_r_unpenalized * self.reward.temperature
+        self.log(
+            "train/loss",
+            loss,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            prog_bar=True,
+        )
+        self.log(
+            "train/logR",
+            last_log_r.mean(),
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+        )
+        self.log(
+            "train/logP(s) (avg)",
+            log_ps.mean(),
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+        )
+        self.log(
+            "train/logP(s) (max)",
+            log_ps.max(),
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+        )
+        self.log(
+            "train/logP(s) unpenalized (avg)",
+            log_ps_unpenalized.mean(),
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+        )
+        self.log(
+            "train/logP(s) unpenalized (max)",
+            log_ps_unpenalized.max(),
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+        )
+        self.log(
+            "train/sentence_len",
+            sentence_len.float().mean(),
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+        )
+
+        return loss
+
+    def validation_step(self, prompt, batch_idx):
+        # Should always be (1, prompt_len)
+        prompt = prompt[0]
+
+        # Sample a sentence and get the reward
+        generated_text, log_pf, log_pterm, log_r, log_r_unpenalized = self.forward(
+            prompt
+        )
+
+        # Get the GFN loss
+        loss = modified_subtb_loss(
+            log_pf=log_pf,
+            log_r=log_r,
+            log_pterm=log_pterm,
+            generated_text=generated_text,
+            termination_token_id=self.end_of_sentence_token_id,
+            prompt_len=len(prompt),
+            subtb_lambda=self.hparams.subtb_lambda,
+        )
+
+        # Log metrics
+        _, last_log_r, last_log_r_unpenalized, sentence_len = get_termination_vals(
+            generated_text=generated_text,
+            log_pf=log_pf,
+            log_pterm=log_pterm,
+            log_r=log_r,
+            log_r_unpenalized=log_r_unpenalized,
+            termination_token_id=self.end_of_sentence_token_id,
+            prompt_len=len(prompt),
+        )
+        log_ps = last_log_r * self.reward.temperature
+        log_ps_unpenalized = last_log_r_unpenalized * self.reward.temperature
+        self.log(
+            "val/loss",
+            loss,
+            sync_dist=True,
+            prog_bar=True,
+        )
+        self.log(
+            "val/logR",
+            last_log_r.mean(),
+            sync_dist=True,
+        )
+        self.log(
+            "val/logP(s) (avg)",
+            log_ps.mean(),
+            sync_dist=True,
+        )
+        self.log(
+            "val/logP(s) (max)",
+            log_ps.max(),
+            sync_dist=True,
+        )
+        self.log(
+            "val/logP(s) unpenalized (avg)",
+            log_ps_unpenalized.mean(),
+            sync_dist=True,
+        )
+        self.log(
+            "val/logP(s) unpenalized (max)",
+            log_ps_unpenalized.max(),
+            sync_dist=True,
+        )
+        self.log(
+            "val/sentence_len",
+            sentence_len.float().mean(),
+            sync_dist=True,
+        )
+        if self.diversity_metric.method is not None:
+            generated_sentences = self.tokenizer.batch_decode(
+                generated_text[:, len(prompt) :]
+            )
+            generated_sentences = [
+                text.replace(".", "") for text in generated_sentences
+            ]
+            diversity = self.diversity_metric(generated_sentences)
+            self.log(f"val/{self.diversity_metric_name}", diversity, sync_dist=True)
+
+    def on_train_batch_start(self, prompt, batch_idx):
+        # Update scheduled quantities
+        reward_temp = self.get_reward_temp_at_step(self.global_step)
+        lr = self.get_lr_at_step(self.global_step)
+        self.reward.temperature = reward_temp
+        for pg in self.optimizers().param_groups:
+            pg["lr"] = lr
+
+    def on_train_epoch_start(self):
+        # Log scheduled quantities
+        self.log("scheduled/R_temperature", self.reward.temperature, sync_dist=True)
+        self.log("scheduled/lr", self.get_lr_at_step(self.global_step), sync_dist=True)
+
+        # Log probe samples
+        if (
+            self.hparams.train_probes is not None
+            and self.logger is not None
+            and self.trainer.current_epoch % 5 == 0
+        ):
+            samples_table = self.sample_probes(self.hparams.train_probes)
+            self.logger.log_table("samples/train_probes", dataframe=samples_table)
+
+    def on_validation_epoch_start(self):
+        # Log variance of (logR - logP(s)) using exploration, which should be 0.0
+        log_rs, log_pfss = [], []
+        val_data = self.trainer.datamodule.val_dataloader().dataset
+        for prompt in val_data:
+            prompt = prompt[0]
+            generated_text, log_pf, log_pterm, log_r, log_r_unpenalized = self.forward(
+                prompt.to(self.device), pf_temperature=2.0
+            )
+            log_pfs, log_r, _, _ = get_termination_vals(
+                generated_text=generated_text,
+                log_pf=log_pf,
+                log_pterm=log_pterm,
+                log_r=log_r,
+                log_r_unpenalized=log_r_unpenalized,
+                termination_token_id=self.end_of_sentence_token_id,
+                prompt_len=len(prompt),
+            )
+            log_rs.append(log_r)
+            log_pfss.append(log_pfs)
+        log_rs, log_pfss = torch.cat(log_rs), torch.cat(log_pfss)
+        self.log("val/Var(logR - logPf(s))", (log_rs - log_pfss).var(), sync_dist=True)
+
+        # Log probe samples
+        if (
+            self.hparams.val_probes is not None
+            and self.logger is not None
+            and self.trainer.current_epoch % 5 == 0
+        ):
+            samples_table = self.sample_probes(self.hparams.val_probes)
+            self.logger.log_table("samples/val_probes", dataframe=samples_table)
+
+    def on_train_start(self):
+        # Log baseline metrics
+        val_data = self.trainer.datamodule.val_dataloader().dataset
+        baseline_performance = None
+        for prompt in val_data:
+            prompt = prompt[0]
+            samples = self.sample_baselines(
+                prompt.to(self.device), n_samples=self.hparams.n_samples
+            )
+            if baseline_performance is None:
+                baseline_performance = pd.DataFrame(
+                    data=np.zeros((6, len(samples))),
+                    columns=samples.keys(),
+                    index=[
+                        "logP(s) (avg)",
+                        "logP(s) (max)",
+                        "logP(s) unpenalized (avg)",
+                        "logP(s) unpenalized (max)",
+                        self.diversity_metric_name,
+                        "sentence length",
+                    ],
+                )
+            for baseline in samples:
+                baseline_performance.loc["logP(s) (avg)", baseline] += samples[
+                    baseline
+                ]["logP(s)"].mean().item() / len(val_data)
+                baseline_performance.loc["logP(s) (max)", baseline] += samples[
+                    baseline
+                ]["logP(s)"].max().item() / len(val_data)
+                baseline_performance.loc[
+                    "logP(s) unpenalized (avg)", baseline
+                ] += samples[baseline]["logP(s) unpenalized"].mean().item() / len(
+                    val_data
+                )
+                baseline_performance.loc[
+                    "logP(s) unpenalized (max)", baseline
+                ] += samples[baseline]["logP(s) unpenalized"].max().item() / len(
+                    val_data
+                )
+                if samples[baseline][self.diversity_metric_name] is None:
+                    baseline_performance.loc[
+                        self.diversity_metric_name, baseline
+                    ] = None
+                else:
+                    baseline_performance.loc[
+                        self.diversity_metric_name, baseline
+                    ] += samples[baseline][self.diversity_metric_name] / len(val_data)
+                baseline_performance.loc["sentence length", baseline] += samples[
+                    baseline
+                ]["sentence length"].float().mean().item() / len(val_data)
+        baseline_performance = baseline_performance.reset_index(names="metric")
+        if self.logger is not None:
+            self.logger.log_table(
+                "val/baseline performance", dataframe=baseline_performance
+            )
+
+        # Log baseline probes
+        if self.hparams.val_probes is not None and self.logger is not None:
+            samples_table = self.sample_probes_baselines(self.hparams.val_probes)
+            self.logger.log_table(
+                "samples/val_probes (baselines)", dataframe=samples_table
+            )
+
+    def sample_probes(self, probes, n_samples=4):
+        assert isinstance(probes, list) and probes[0].ndim == 1
+        samples = []
+        for probe in probes:
+            probe_str = self.tokenizer.decode(probe)
+            with torch.no_grad():
+                generated_text, _, _, log_r, log_r_unpenalized = self.forward(
+                    probe.to(self.device), n_samples=n_samples
+                )
+            log_ps, log_ps_unpenalized = get_termination_vals(
+                generated_text=generated_text,
+                log_pf=None,
+                log_pterm=None,
+                log_r=log_r,
+                log_r_unpenalized=log_r_unpenalized,
+                termination_token_id=self.end_of_sentence_token_id,
+                prompt_len=len(probe),
+            )[1:3]
+            log_ps *= self.reward.temperature
+            log_ps_unpenalized *= self.reward.temperature
+            generated_text = generated_text[:, len(probe) :]
+            generated_text = self.tokenizer.batch_decode(generated_text)
+            generated_text = [text.replace(".", "") for text in generated_text]
+            for i in range(len(generated_text)):
+                samples.append(
+                    {
+                        "Prompt": probe_str,
+                        "Sampled sentence": generated_text[i],
+                        "logP(s)": log_ps[i].item(),
+                        "logP(s) unpenalized": log_ps_unpenalized[i].item(),
+                    }
+                )
+        samples = pd.DataFrame(samples)
+        samples = samples.sort_values(by=["Prompt", "logP(s)"], ascending=False)
+        return samples
+
+    def sample_probes_baselines(self, probes, n_samples=4):
+        assert isinstance(probes, list) and probes[0].ndim == 1
+        samples = []
+        for probe in probes:
+            probe_str = self.tokenizer.decode(probe)
+            probe_samples = self.sample_baselines(
+                probe.to(self.device), n_samples=n_samples
+            )
+            for i in range(n_samples):
+                sample = {"Prompt": probe_str}
+                for baseline in probe_samples:
+                    sample[f"Sampled sentence ({baseline})"] = probe_samples[baseline][
+                        "sample"
+                    ][i]
+                    sample[f"logP(s) ({baseline})"] = probe_samples[baseline][
+                        "logP(s)"
+                    ][i].item()
+                    sample[f"logP(s) unpenalized ({baseline})"] = probe_samples[
+                        baseline
+                    ]["logP(s) unpenalized"][i].item()
+                samples.append(sample)
+
+        samples = pd.DataFrame(samples)
+        samples = samples.sort_values(by=["Prompt"], ascending=False)
+
+        return samples
+
+    def sample_baselines(self, prompt, n_samples=4):
+        # https://huggingface.co/docs/transformers/v4.31.0/en/main_classes/text_generation#transformers.GenerationMixin.generate
+        # https://huggingface.co/docs/transformers/v4.31.0/en/main_classes/text_generation#transformers.GenerationConfig
+        assert prompt.ndim == 1
+        prompt = prompt.unsqueeze(0)
+
+        def generate(prompt, **kwargs):
+            with torch.no_grad():
+                lora_to_base(self.model)
+                generated_text = self.model.generate(
+                    prompt,
+                    min_new_tokens=self.hparams.min_sentence_len,
+                    max_new_tokens=self.hparams.max_sentence_len + 1,
+                    eos_token_id=self.end_of_sentence_token_id,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    forced_eos_token_id=self.end_of_sentence_token_id,
+                    suppress_tokens=torch.from_numpy(self.hparams.illegal_token_mask)
+                    .nonzero()
+                    .squeeze(-1),
+                    **kwargs,
+                )
+                base_to_lora(self.model)
+
+                log_r, log_r_unpenalized = self.reward.score(
+                    generated_text,
+                    prompt_length=prompt.shape[1],
+                    model=self.model,
+                    tokenizer=self.tokenizer,
+                )
+                (
+                    _,
+                    last_log_r,
+                    last_log_r_unpenalized,
+                    sentence_len,
+                ) = get_termination_vals(
+                    generated_text=generated_text,
+                    log_pf=None,
+                    log_pterm=None,
+                    log_r=log_r,
+                    log_r_unpenalized=log_r_unpenalized,
+                    termination_token_id=self.end_of_sentence_token_id,
+                    prompt_len=prompt.shape[1],
+                )
+                log_ps = last_log_r * self.reward.temperature
+                log_ps_unpenalized = last_log_r_unpenalized * self.reward.temperature
+
+            generated_text = generated_text[:, prompt.shape[1] :]
+            generated_text = torch.where(
+                generated_text == self.tokenizer.eos_token_id,
+                self.end_of_sentence_token_id,
+                generated_text,
+            )
+            generated_text = self.tokenizer.batch_decode(generated_text)
+            generated_text = [text.replace(".", "") for text in generated_text]
+
+            if len(generated_text) > 1:
+                diversity = self.diversity_metric(generated_text)
+            else:
+                diversity = None
+
+            if len(generated_text) == 1:
+                generated_text = generated_text * n_samples
+                log_ps = log_ps.expand(n_samples, -1)
+                log_ps_unpenalized = log_ps_unpenalized.expand(n_samples, -1)
+
+            return {
+                "sample": generated_text,
+                "logP(s)": log_ps,
+                "logP(s) unpenalized": log_ps_unpenalized,
+                "sentence length": sentence_len,
+                self.diversity_metric_name: diversity,
+            }
+
+        samples = {}
+
+        # Beam search
+        samples["beam"] = generate(
+            prompt=prompt,
+            do_sample=False,
+            num_beams=n_samples * 5,
+            length_penalty=0.0,
+        )
+        samples["beam [fair]"] = generate(
+            prompt=prompt,
+            do_sample=False,
+            num_beams=n_samples,
+            length_penalty=0.0,
+        )
+
+        # Diverse beam search
+        samples["diverse beam"] = generate(
+            prompt=prompt,
+            num_beams=n_samples * 5,
+            num_beam_groups=n_samples,
+            num_return_sequences=n_samples,
+            diversity_penalty=1.0,
+            length_penalty=0.0,
+        )
+        samples["diverse beam [fair]"] = generate(
+            prompt=prompt,
+            num_beams=n_samples,
+            num_beam_groups=n_samples,
+            num_return_sequences=n_samples,
+            diversity_penalty=1.0,
+            length_penalty=0.0,
+        )
+
+        # Nucleaus sampling
+        samples["nucleus"] = generate(
+            prompt=prompt,
+            do_sample=True,
+            num_return_sequences=n_samples,
+            top_k=0,
+            top_p=0.95,
+        )
+
+        # LM
+        samples["LM"] = generate(
+            prompt=prompt,
+            do_sample=True,
+            num_return_sequences=n_samples,
+            top_k=0,
+        )
+
+        # LM with temperature
+        samples["LM tempered"] = generate(
+            prompt=prompt,
+            do_sample=True,
+            num_return_sequences=n_samples,
+            top_k=0,
+            temperature=self.hparams.reward_temp_end,
+        )
+
+        # Greedy
+        samples["greedy"] = generate(
+            prompt=prompt,
+            do_sample=False,
+        )
+
+        return samples
+
+    def configure_optimizers(self):
+        if self.hparams.use_4bit:
+            import bitsandbytes as bnb  # fmt: skip
+            return bnb.optim.PagedAdamW8bit(self.model.parameters(), lr=self.hparams.lr)
+        else:
+            return torch.optim.AdamW(self.model.parameters(), lr=self.hparams.lr)
+
+File Path: next_sentence/train.py
+Content:
+from types import MethodType
+import hydra
+import torch
+import pytorch_lightning as pl
+from omegaconf import DictConfig, OmegaConf
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    BitsAndBytesConfig,
+)
+from peft import get_peft_model, prepare_model_for_kbit_training
+from utils import (
+    FrozenModelSentenceGivenPrompt,
+    RuleSentenceValidator,
+    ModelSentenceValidator,
+    ReplayBuffer,
+)
+from lightning_module import NextSentenceGFNTask
+from lightning_data import PromptDataModule
+
+
+@hydra.main(version_base=None, config_path="./configs/", config_name="train")
+def train(config: DictConfig):
+    pl.seed_everything(config.seed, workers=True)
+
+    model, tokenizer = get_model(config)
+
+    try:  # Some tokenizers encode a "." differently when it is the first token
+        end_of_sentence_token_id = tokenizer.encode(
+            "A sentence.", add_special_tokens=False
+        )[-1]
+    except:
+        end_of_sentence_token_id = tokenizer.convert_tokens_to_ids(".")
+    illegal_token_mask = torch.zeros(tokenizer.vocab_size, dtype=torch.bool)
+    illegal_tokens = OmegaConf.to_container(config.task.constraints.illegal_tokens)
+    illegal_tokens = [
+        [t] if isinstance(t, int) else tokenizer.encode(t, add_special_tokens=False)
+        for t in illegal_tokens
+    ]
+    assert all(len(t) == 1 for t in illegal_tokens)
+    illegal_tokens = [t[0] for t in illegal_tokens]
+    illegal_token_mask[illegal_tokens] = True
+    illegal_token_mask = illegal_token_mask.numpy()
+
+    reward = get_reward(config, end_of_sentence_token_id, illegal_token_mask)
+    reward_buffer = ReplayBuffer(
+        buffer_size=config.task.reward.buffer_size,
+        termination_token_id=end_of_sentence_token_id,
+    )
+
+    data = PromptDataModule(
+        data_path=config.task.data.path,
+        tokenizer=tokenizer,
+        train_size=config.task.data.train_size,
+        limit_prompts=config.task.data.limit_prompts,
+    )
+    data.setup("fit")
+    train_probes = [data.train_data[i][0] for i in range(config.task.eval.n_probes)]
+    val_probes = [data.val_data[i][0] for i in range(config.task.eval.n_probes)]
+
+    task = NextSentenceGFNTask(
+        model=model,
+        tokenizer=tokenizer,
+        reward=reward,
+        reward_buffer=reward_buffer,
+        n_samples=config.task.training.n_samples,
+        lr=config.task.training.lr,
+        subtb_lambda=config.task.training.subtb_lambda,
+        pf_temp_high=config.task.training.pf_temp_high,
+        pf_temp_low=config.task.training.pf_temp_low,
+        pf_temp_prob=config.task.training.pf_temp_prob,
+        use_buffer_prob=config.task.training.use_buffer_prob,
+        min_sentence_len=config.task.constraints.min_sentence_len,
+        max_sentence_len=config.task.constraints.max_sentence_len,
+        reward_temp_start=config.task.reward.temp_start,
+        reward_temp_end=config.task.reward.temp_end,
+        reward_temp_horizon=config.task.reward.temp_horizon,
+        illegal_token_mask=illegal_token_mask,
+        train_probes=train_probes,
+        val_probes=val_probes,
+        diversity_metric=config.task.eval.diversity_metric,
+        use_4bit=config.task.training.use_4bit,
+    )
+
+    trainer = pl.Trainer(
+        accelerator=config.device.accelerator,
+        max_epochs=config.task.training.epochs,
+        accumulate_grad_batches=config.task.training.accumulate_grad_batches,
+        logger=config.logger
+        if isinstance(config.logger, bool)
+        else hydra.utils.instantiate(config.logger),
+        callbacks=[hydra.utils.instantiate(c) for c in config.task.callbacks],
+    )
+
+    # Fix a bug that arises when using 4-bit quantized models.
+    # It's caused by different operations being on different devices,
+    # so we'll just deactivate lightning's automatic device placement
+    # and let huggingface handle the dynamic device placement
+    if config.task.training.use_4bit:
+        task.to = MethodType(lambda s, _: s, task)
+        task.cuda = MethodType(lambda s: s, task)
+
+    trainer.fit(model=task, datamodule=data)
+
+
+def get_model(config: DictConfig):
+    # Use 4-bit quantization for lower memory use
+    if config.task.training.use_4bit:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype="float16",
+            bnb_4bit_use_double_quant=True,
+        )
+    else:
+        bnb_config = None
+
+    # Get the model
+    tokenizer = AutoTokenizer.from_pretrained(
+        config.task.model.name, add_bos_token=False
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        config.task.model.name, device_map="auto", quantization_config=bnb_config
+    )
+
+    # Prepare model for k-bit training
+    if config.task.training.use_4bit:
+        model = prepare_model_for_kbit_training(
+            model,
+            use_gradient_checkpointing=False,  # Doesn't save memory when generating autoregressively compared to caching
+        )
+
+    # Wrap using Lora
+    model = get_peft_model(
+        model, hydra.utils.instantiate(config.task.model.lora_config)
+    )
+
+    # Remove dropout
+    for mod in model.modules():
+        if isinstance(mod, torch.nn.Dropout):
+            mod.p = 0.0
+
+    return model, tokenizer
+
+
+def get_reward(config: DictConfig, sentence_token_id, illegal_token_mask):
+    if config.task.reward.sentence_validator is None:
+        sentence_validator, valid_sentence_alpha = None, None
+    elif config.task.reward.sentence_validator == "rule":
+        sentence_validator, valid_sentence_alpha = (
+            RuleSentenceValidator(sentence_token_id=sentence_token_id),
+            config.task.reward.valid_sentence_alpha,
+        )
+    elif config.task.reward.sentence_validator == "model":
+        sentence_validator, valid_sentence_alpha = (
+            ModelSentenceValidator(sentence_token_id=sentence_token_id),
+            config.task.reward.valid_sentence_alpha,
+        )
+    else:
+        raise ValueError(
+            f"Invalid sentence validator: {config.task.reward.sentence_validator}"
+        )
+
+    reward = FrozenModelSentenceGivenPrompt(
+        sentence_token_id=sentence_token_id,
+        min_len=config.task.constraints.min_sentence_len,
+        vocab_alpha=config.task.reward.vocab_alpha,
+        vocab_naughty_mask=illegal_token_mask,
+        sentence_validator=sentence_validator,
+        valid_sentence_alpha=valid_sentence_alpha,
+    )
+
+    return reward
+
+
+if __name__ == "__main__":
+    train()
+
+File Path: next_sentence/utils.py
+Content:
+import torch
+import heapq
+import pickle
+import gzip
+import editdistance
+import spacy
+import numpy as np
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from sentence_transformers import SentenceTransformer
+from sentence_transformers.util import cos_sim
+
+
+def lora_to_base(model):
+    model.base_model.disable_adapter_layers()
+    model.eval()
+
+
+def base_to_lora(model):
+    model.base_model.enable_adapter_layers()
+    model.train()
+
+
+@torch.no_grad()
+def score_fast(
+    model,
+    encoded_input,
+    termination_token_id,
+    min_len,
+    skip_first,
+    vocab_nice_mask=None,
+    vocab_naughty_mask=None,
+    vocab_alpha=-99,
+    prompt_cache=None,
+):
+    if prompt_cache is None:
+        logits = model(encoded_input).logits
+    else:
+        # prompt_cache[1] contains past_key_values which need to be reshaped to the right batch size from encoded_input
+        batched_prompt_cache = tuple(
+            tuple(
+                [
+                    prompt_cache[1][i][j].repeat(encoded_input.shape[0], 1, 1, 1)
+                    for j in range(len(prompt_cache[1][i]))
+                ]
+            )
+            for i in range(len(prompt_cache[1]))
+        )
+        logits = model(encoded_input, past_key_values=batched_prompt_cache).logits
+    # get rid of the first few tokens
+    logits = logits[:, skip_first - 1 :]
+    # score the log probability of the input sequence while ignoring termination and padding tokens
+    if vocab_nice_mask is not None:
+        # add vocab_alpha to the logits of the unmasked vocab items
+        logits[:, :, ~vocab_nice_mask] += vocab_alpha
+    elif vocab_naughty_mask is not None:
+        # add vocab_alpha to the logits of the masked vocab items
+        logits[:, :, vocab_naughty_mask] += vocab_alpha
+    logprob = logits.log_softmax(-1)
+    token_ids = encoded_input[:, skip_first:].unsqueeze(-1)
+    logPF = logprob[:, :-1].gather(-1, token_ids).squeeze(-1)
+    logP = logPF.cumsum(dim=-1)  # logP(generated[:i+1] | prompt)
+    reward = logprob[
+        :, :, termination_token_id
+    ]  # logP(generated[i+1]=term | prompt + generated[:i+1])
+    reward[:, 1:] += logP  # logP(generated[:i] + term | prompt)
+    non_term_mask = (encoded_input != termination_token_id)[:, skip_first:]
+    non_term_mask = torch.cat(
+        (
+            non_term_mask.new_ones(non_term_mask.shape[0], 1),
+            non_term_mask,
+        ),
+        dim=-1,
+    )  # Start (i.e., empty) state has never terminated
+    reward[~non_term_mask] = 0.0
+    reward_unpenalized = reward.clone()
+    reward = torch.where(non_term_mask.cumsum(dim=-1) - 1 < min_len, -99, reward)
+    return reward, reward_unpenalized
+
+
+class FrozenModelSentenceGivenPrompt:
+    def __init__(
+        self,
+        sentence_token_id,
+        temperature=1.0,
+        min_len=1,
+        vocab_alpha=-50.0,
+        vocab_nice_mask=None,
+        vocab_naughty_mask=None,
+        sentence_validator=None,
+        valid_sentence_alpha=None,
+    ):
+        assert (
+            sentence_validator is None
+            and valid_sentence_alpha is None
+            or sentence_validator is not None
+            and valid_sentence_alpha is not None
+        )
+
+        self.temperature = temperature
+        self.sentence_token_id = sentence_token_id
+        self.vocab_nice_mask = vocab_nice_mask
+        self.vocab_naughty_mask = vocab_naughty_mask
+        self.vocab_alpha = vocab_alpha
+        self.min_len = min_len
+        self.sentence_validator = sentence_validator
+        self.valid_sentence_alpha = valid_sentence_alpha
+
+    def score(self, input_batch, prompt_length, model, tokenizer):
+        lora_to_base(model)
+        training = model.training
+        model.eval()
+        reward, reward_unpenalized = score_fast(
+            model=model,
+            encoded_input=input_batch,
+            termination_token_id=self.sentence_token_id,
+            skip_first=prompt_length,
+            vocab_nice_mask=self.vocab_nice_mask,
+            vocab_naughty_mask=self.vocab_naughty_mask,
+            vocab_alpha=self.vocab_alpha,
+            min_len=self.min_len,
+        )
+        reward /= self.temperature
+        reward_unpenalized /= self.temperature
+        base_to_lora(model)
+        if training:
+            model.train()
+
+        if self.sentence_validator is not None:
+            invalid = self.sentence_validator(input_batch[:, prompt_length:], tokenizer)
+            invalid = invalid * self.valid_sentence_alpha
+            reward = torch.min(reward, invalid)
+
+        return reward, reward_unpenalized
+
+
+class SentenceValidator:
+    def __init__(self, sentence_token_id) -> None:
+        self.sentence_token_id = sentence_token_id
+
+    def __call__(self, sentences, tokenizer):
+        pass
+
+
+class RuleSentenceValidator(SentenceValidator):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.nlp = spacy.load("en_core_web_lg")
+
+    def __call__(self, sentences, tokenizer):
+        invalid = torch.zeros(
+            sentences.shape[0],
+            sentences.shape[1] + 1,
+            dtype=torch.bool,
+            device=sentences.device,
+        )
+        invalid[:, 0] = True  # Empty sentence is never valid
+        for i in range(sentences.shape[0]):
+            for j in range(sentences.shape[1]):
+                if sentences[i, j] == self.sentence_token_id:
+                    break  # Only unterminated sentences get a reward
+                sent = tokenizer.decode(sentences[i, : j + 1])
+                sent = self.nlp(sent).sents
+                tokens = []
+                for s in sent:
+                    for t in s:
+                        tokens.append(t)
+                if not (len(tokens) >= 2 and tokens[0].is_space and tokens[1].is_title):
+                    invalid[i, j + 1] = True  # Must start with a space and capital
+                    continue
+                has_noun = 1
+                has_verb = 1
+                for token in tokens:
+                    if token.pos_ in ["NOUN", "PROPN", "PRON"]:
+                        has_noun -= 1
+                    elif token.pos_ in ["VERB", "AUX"]:
+                        has_verb -= 1
+                if has_noun > 0 or has_verb > 0:
+                    invalid[i, j + 1] = True  # Must have a noun and a verb
+        return invalid
+
+
+class ModelSentenceValidator(SentenceValidator):
+    def __init__(self, *args, model_name=None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        if model_name is None:
+            model_name = "textattack/roberta-base-CoLA"
+        self.model_name = model_name
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForSequenceClassification.from_pretrained(
+            model_name, device_map="auto"
+        )
+
+    @torch.no_grad()
+    def __call__(self, sentences, tokenizer):
+        sentences = sentences.to(self.model.device)
+        invalid = torch.zeros(
+            sentences.shape[0],
+            sentences.shape[1] + 1,
+            dtype=torch.bool,
+            device=self.model.device,
+        )
+        invalid[:, 0] = True  # Empty sentence is never valid
+        done = torch.zeros(sentences.shape[0]).bool().to(self.model.device)
+        for i in range(sentences.shape[1]):
+            sent = sentences[:, : i + 1]
+            done |= sent[:, -1] == self.sentence_token_id
+            if done.all():
+                break
+            sent = self.tokenizer(
+                tokenizer.batch_decode(sent),
+                padding=True,
+                return_tensors="pt",
+            ).to(self.model.device)
+            invalid_probs = self.model(**sent).logits.softmax(dim=-1)[:, 0]
+            invalid[~done, i + 1] = invalid_probs[~done] > 0.2
+        return invalid
+
+
+def generate_and_return_termination_logprob(
+    model,
+    encoded_prompt,
+    termination_token_id,
+    reward_fn,
+    vocab_nice_mask=None,
+    vocab_naughty_mask=None,
+    vocab_alpha=-99,
+    max_len=10,
+    min_len=0,
+    temperature=1.0,
+    top_k=999999,
+    top_p=1.0,
+    action_seq=None,
+    skip_rewards=False,
+):
+    # generate and return the probability of terminating at every step
+    active_seqs = torch.ones(encoded_prompt.size(0)).bool().to(encoded_prompt.device)
+    state = encoded_prompt.clone()
+    log_pf = []
+    log_pterm = []
+    token_ids = state  # For caching hidden states during generation
+    past_key_values = None  # For caching hidden states during generation
+    for i in range(max_len + 1):
+        output = model(input_ids=token_ids, past_key_values=past_key_values)
+        past_key_values = output.past_key_values
+        logits = output.logits[:, -1, :]
+        if action_seq is None:
+            with torch.no_grad():
+                prob = logits.softmax(dim=-1)
+                modified_logits = logits.clone().detach()
+                # implement top-k by getting the top-k largest values and setting the rest to 0
+                if top_k < 999999:
+                    modified_logits[prob >= prob.topk(top_k)] = -torch.inf
+                # implement top-p by getting indices in the top-p prob mass and setting the rest to 0
+                if top_p < 1.0:
+                    sorted_probs, _ = torch.sort(prob, dim=-1, descending=True)
+                    cumsum_prob = torch.cumsum(sorted_probs, dim=-1)
+                    nucleus = cumsum_prob < top_p
+                    nucleus = torch.cat(
+                        [
+                            nucleus.new_ones(nucleus.shape[:-1] + (1,)),
+                            nucleus[..., :-1],
+                        ],
+                        dim=-1,
+                    )
+                    modified_logits[~nucleus] = -torch.inf
+                if i < min_len:
+                    # if we haven't reach the minimum length, set the probability of terminating to 0
+                    modified_logits[:, termination_token_id] = -torch.inf
+                elif i >= max_len:
+                    # if we've reached the maximum length, set the probability of terminating to 1
+                    mask = [True] * modified_logits.shape[1]
+                    mask[termination_token_id] = False
+                    modified_logits[:, mask] = -torch.inf
+                if vocab_nice_mask is not None:
+                    # add vocab_alpha to the logits of the unmasked vocab items
+                    modified_logits[:, ~vocab_nice_mask] += vocab_alpha
+                if vocab_naughty_mask is not None:
+                    # add vocab_alpha to the logits of the masked vocab items
+                    modified_logits[:, vocab_naughty_mask] += vocab_alpha
+                prob = (modified_logits / temperature).softmax(dim=-1)
+                token_ids = torch.multinomial(prob, num_samples=1)
+        else:
+            if i >= action_seq.size(-1):
+                token_ids = (
+                    torch.ones_like(action_seq[:, 0]) * termination_token_id
+                ).unsqueeze(-1)
+            else:
+                token_ids = action_seq[:, i].unsqueeze(-1)
+        token_ids = torch.where(
+            active_seqs.unsqueeze(-1),
+            token_ids,
+            termination_token_id,
+        )
+        if vocab_nice_mask is not None:
+            logits[:, ~vocab_nice_mask] += vocab_alpha
+        if vocab_naughty_mask is not None:
+            logits[:, vocab_naughty_mask] += vocab_alpha
+        logprob = logits.log_softmax(dim=-1)
+        log_pterm.append(
+            torch.where(
+                active_seqs,
+                logprob[:, termination_token_id],
+                0,
+            )
+        )
+        active_seqs = active_seqs * (token_ids != termination_token_id).squeeze(-1)
+        log_pf.append(
+            torch.where(
+                active_seqs,
+                logprob.gather(-1, token_ids).squeeze(-1),
+                0,
+            )
+        )
+        state = torch.cat([state, token_ids], dim=-1)
+        # check if all sequences have terminated
+        if torch.all(~active_seqs):
+            break
+    log_pf = torch.stack(log_pf, dim=1)
+    log_pterm = torch.stack(log_pterm, dim=1)
+    if skip_rewards:
+        log_r, log_r_unpenalized = None, None
+    else:
+        # Reward for all intermediate states (except the last one,
+        # which is guaranteed to be the termination token)
+        log_r, log_r_unpenalized = reward_fn(state[:, :-1])
+    # add a termination token to the end of the sequence
+    return state, log_pf, log_pterm, log_r, log_r_unpenalized
+
+
+def modified_subtb_loss(
+    log_pf,
+    log_r,
+    log_pterm,
+    generated_text,
+    termination_token_id,
+    prompt_len,
+    subtb_lambda=1.0,
+):
+    assert (
+        log_pf.shape[1]
+        == log_r.shape[1]
+        == log_pterm.shape[1]
+        == generated_text.shape[1] - prompt_len
+    )
+    assert (
+        log_pf.shape[1] > 1
+    )  # With modified-style losses, we need at least one transition before terminating
+
+    delta = (
+        log_r[:, :-1]
+        + log_pf[:, :-1]
+        + log_pterm[:, 1:]
+        - log_r[:, 1:]
+        - log_pterm[:, :-1]
+    )
+    delta_cumsum = torch.cat([torch.zeros_like(delta[:, :1]), delta], 1).cumsum(1)
+
+    # Get a mask for tokens after the termination token in the generated_text
+    mask = (generated_text[:, prompt_len:-1] == termination_token_id).cumsum(-1) >= 1
+
+    batch_loss = 0.0
+    total_lambda = 0.0
+    generated_len = generated_text.shape[1] - prompt_len
+    for subtraj_len in range(1, generated_len):
+        subtb_term = (
+            delta_cumsum[:, subtraj_len:] - delta_cumsum[:, :-subtraj_len]
+        ) ** 2
+        subtb_term[mask[:, subtraj_len - 1 :]] = 0
+        batch_loss += subtb_lambda ** (subtraj_len - 1) * subtb_term.sum()
+        total_lambda += (
+            subtb_lambda ** (subtraj_len - 1) * (~mask[:, subtraj_len - 1 :]).sum()
+        )
+    batch_loss /= total_lambda
+
+    return batch_loss
+
+
+def get_termination_vals(
+    generated_text,
+    log_pf,
+    log_pterm,
+    log_r,
+    log_r_unpenalized,
+    termination_token_id,
+    prompt_len,
+):
+    batch_idx = torch.arange(generated_text.size(0))
+    gen_len = (
+        (generated_text[:, prompt_len:] == termination_token_id).byte().argmax(dim=-1)
+    )
+    if log_pf is None and log_pterm is None:
+        log_pfs = None
+    else:
+        log_pf = torch.cat([torch.zeros_like(log_pf[:, :1]), log_pf], dim=-1)[:, :-1]
+        log_pfs = log_pf.cumsum(dim=-1) + log_pterm
+        log_pfs = log_pfs[batch_idx, gen_len]
+    log_r = log_r[batch_idx, gen_len]
+    log_r_unpenalized = log_r_unpenalized[batch_idx, gen_len]
+    return log_pfs, log_r, log_r_unpenalized, gen_len
+
+
+class SequenceDiversity:
+    def __init__(self, method, **kwargs):
+        self.method = method
+        if method is None:
+            pass
+        elif method == "sequence_embedding":
+            model_name = kwargs.get(
+                "model_name", "sentence-transformers/all-mpnet-base-v2"
+            )
+            self.model = SentenceTransformer(model_name)
+        else:
+            raise ValueError(f"Unknown sequence diversity method: {method}")
+
+    @torch.no_grad()
+    def __call__(self, sequences):
+        if self.method is None:
+            return None
+        elif self.method == "sequence_embedding":
+            embeddings = self.model.encode(sequences, show_progress_bar=False)
+            sim = cos_sim(embeddings, embeddings)
+            indices = torch.triu_indices(len(sequences), len(sequences), offset=1)
+            diversity = 1 - sim[indices[0], indices[1]].mean().item()
+        else:
+            raise ValueError(f"Unknown sequence diversity method: {self.method}")
+        return diversity
+
+
+class ReplayBuffer:
+    """
+    A relay buffer that uses a heap to keep the max_size items with the highest reward
+    """
+
+    def __init__(self, buffer_size, termination_token_id, sim_tolerance=0.25):
+        self.buffer_size = buffer_size
+        self.termination_token_id = termination_token_id
+        self.sim_tolerance = sim_tolerance
+        self.reset()
+
+    def reset(self):
+        self._buffer = {}
+
+    def add(self, item):
+        """
+        add an item to the buffer, where item = [log reward, tensor of shape (seq_len, )]
+        """
+        # if item is already in the buffer, skip it
+        str_prompt = item["str_prompt"]
+        if item["str_sentence"] in self._buffer[str_prompt]["exists"]:
+            return
+        # if the edit distance between item and any item in the buffer is small, skip it
+        tokenized_sentence = [
+            x
+            for x in item["tensor_sentence"].tolist()
+            if x != self.termination_token_id
+        ]
+        for buffer_item in self._buffer[str_prompt]["sentences"]:
+            tokenized_existing_sentence = [
+                x for x in buffer_item[2].tolist() if x != self.termination_token_id
+            ]
+            if (
+                editdistance.eval(tokenized_sentence, tokenized_existing_sentence)
+                < (len(tokenized_sentence) + len(tokenized_existing_sentence))
+                * self.sim_tolerance
+            ):
+                if buffer_item[0] >= item["logreward"]:
+                    return
+                else:
+                    self._buffer[str_prompt]["exists"].remove(buffer_item[1])
+                    self._buffer[str_prompt]["sentences"].remove(buffer_item)
+                    heapq.heapify(self._buffer[str_prompt]["sentences"])
+                    self._buffer[str_prompt]["exists"].add(item["str_sentence"])
+                    heapq.heappush(
+                        self._buffer[str_prompt]["sentences"],
+                        (
+                            item["logreward"],
+                            item["str_sentence"],
+                            item["tensor_sentence"],
+                            item["full_logrewards"],
+                        ),
+                    )
+                    return
+        self._buffer[str_prompt]["exists"].add(item["str_sentence"])
+        if len(self._buffer[str_prompt]["sentences"]) >= self.buffer_size:
+            popped = heapq.heappushpop(
+                self._buffer[str_prompt]["sentences"],
+                (
+                    item["logreward"],
+                    item["str_sentence"],
+                    item["tensor_sentence"],
+                    item["full_logrewards"],
+                ),
+            )
+            self._buffer[str_prompt]["exists"].remove(popped[1])
+        else:
+            heapq.heappush(
+                self._buffer[str_prompt]["sentences"],
+                (
+                    item["logreward"],
+                    item["str_sentence"],
+                    item["tensor_sentence"],
+                    item["full_logrewards"],
+                ),
+            )
+
+    def add_batch(self, prompt, sentences, logrewards, tokenizer):
+        """
+        add a batch of items to the buffer
+        """
+        str_prompt = " ".join([str(x) for x in prompt.tolist()])
+        if str_prompt not in self._buffer:
+            self._buffer[str_prompt] = {
+                "tensor_prompt": prompt,
+                "sentences": [],
+                "exists": set(),
+            }
+        sentences[
+            (sentences == self.termination_token_id).cumsum(dim=-1) >= 1
+        ] = self.termination_token_id
+        token_sentences = tokenizer.batch_decode(sentences)
+        for i in range(sentences.size(0)):
+            str_sentence = token_sentences[i].replace(".", "").strip()
+            self.add(
+                {
+                    "logreward": logrewards[
+                        i, (sentences[i] != self.termination_token_id).sum()
+                    ].item(),
+                    "str_prompt": str_prompt,
+                    "str_sentence": str_sentence,
+                    "tensor_sentence": sentences[i],
+                    "full_logrewards": logrewards[i, :],
+                }
+            )
+
+    def sample(self, batch_size, prompt):
+        """
+        uniformly sample a batch of items from the buffer,
+        and return a stacked tensor
+        """
+        str_prompt = " ".join([str(x) for x in prompt.tolist()])
+        if str_prompt not in self._buffer:
+            return None, None
+        prompt_buffer = self._buffer[str_prompt]["sentences"]
+        idx = np.random.choice(
+            len(prompt_buffer),
+            batch_size,
+            replace=True,
+        )
+        return torch.nn.utils.rnn.pad_sequence(
+            [prompt_buffer[i][2] for i in idx],
+            batch_first=True,
+            padding_value=self.termination_token_id,
+        ), torch.nn.utils.rnn.pad_sequence(
+            [prompt_buffer[i][3] for i in idx],
+            batch_first=True,
+            padding_value=0,
+        )
+
+    def print(self):
+        for key in self._buffer:
+            print(key)
+            for item in self._buffer[key]["sentences"]:
+                print(item[1])
+            print("")
+
+    def save(self, path):
+        with gzip.open(path, "wb") as f:
+            pickle.dump(self._buffer, f)
+
+File Path: rng/data_generator.py
+Content:
+import hydra
+import numpy as np
+import pandas as pd
+import random
+from omegaconf import DictConfig, OmegaConf, ListConfig
+import json
+from tqdm import tqdm
+from rng.rng_utils import format_dict
+import os
+
+
+def generate_data_for_distribution(distribution, params, data_type, prompts):
+    if distribution == "uniform discrete":
+        data = np.random.randint(int(params["a"]), int(params["b"]) + 1)
+    elif distribution == "poisson":
+        data = np.random.poisson(params["lam"])
+    elif distribution == "binomial":
+        data = np.random.binomial(params["n"], params["p"])
+    elif distribution == "geometric":
+        data = np.random.geometric(params["p"])
+    elif distribution == "gaussian":
+        data = np.random.normal(params["mean"], params["std_dev"])
+    elif distribution == "exponential":
+        data = np.random.exponential(params["scale"])
+    elif distribution == "uniform continuous":
+        data = np.random.uniform(params["a"], params["b"])
+    else:
+        raise ValueError(f"Unsupported distribution: {distribution}")
+
+    type_of_number = "integer" if data_type == "int" else "real number"
+
+    instantiated_prompt = random.choice(prompts).format(
+        type_of_number=type_of_number,
+        distribution=distribution,
+        parameters=format_dict(params),
+    )
+
+    df = pd.DataFrame(
+        {
+            "Prompt": instantiated_prompt,
+            "Value": data,
+            "Distribution and Parameters": json.dumps({'distribution': distribution, 'data_type': data_type} | params),
+            "Distribution": distribution,
+            "Parameters": json.dumps(params),
+            "Data Type": data_type
+        },
+        index=[0],
+    )
+
+    return df
+
+
+# hydra.initialize(config_path="configs/")
+
+def build_distribution_and_params_list(df):
+    return [json.loads(d) for d in df["Distribution and Parameters"].unique().tolist()]
+
+
+@hydra.main(config_path="configs/", config_name="config", version_base=None)
+def main(cfg):
+    all_data_train = []
+    distribution_and_params_dict = {}
+    distribution_and_params_count = 0
+
+    for dist in cfg.distributions.target_distributions:
+        params = cfg.distributions[dist].parameters
+        data_type = cfg.distributions[dist].type
+        n_samples = cfg.distributions[dist].get("n_samples", cfg.hparams.n_samples)
+        if n_samples is None:
+            n_samples = 100
+        df_train = []
+        for _ in tqdm(range(n_samples), desc=f"Generating {dist} data"):
+            sampled_params = {
+                k: random.choice(v) if isinstance(v, ListConfig) else v
+                for k, v in params.items()
+            }
+            df = generate_data_for_distribution(
+                    dist, sampled_params, data_type, cfg.prompts
+                )
+            if df["Distribution and Parameters"][0] not in distribution_and_params_dict:
+                distribution_and_params_dict[df["Distribution and Parameters"][0]] = distribution_and_params_count
+                distribution_and_params_count += 1
+            df["Distribution and Parameters Index"] = distribution_and_params_dict[df["Distribution and Parameters"][0]]
+            df_train.append(df)
+        all_data_train.extend(df_train)
+
+    final_df_train = pd.concat(all_data_train, ignore_index=True)
+    
+    directory = os.path.dirname(cfg.file_name.train)
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+
+    final_df_train.to_csv(cfg.file_name.train, index=False)
+    # visualize(final_df)
+    # plt.savefig('images/data_visualization.png')
+
+    return final_df_train
+
+
+if __name__ == "__main__":
+    main()
+
+File Path: rng/rng_dataset.py
+Content:
+import torch
+from tqdm import tqdm
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+from torch.nn.utils.rnn import pad_sequence
+
+
+def split_dataframe(df, test_size=0.2, random_state=None):
+    train_df, test_df = train_test_split(
+        df, test_size=test_size, random_state=random_state
+    )
+    return train_df, test_df
+
+
+def get_tensors_from_dataframe(df, tokenizer, method="GFN"):
+    prompts = df["Prompt"].tolist()
+
+    if method == "SFT":
+        labels = df["Value"].tolist()
+    else:
+        labels = df["Distribution and Parameters Index"].tolist()
+
+    input_ids = []
+    output_ids = []
+
+    for prompt, label in tqdm(zip(prompts, labels), desc="Tokenizing dataset..."):
+        encoded_prompt = tokenizer.encode(
+            prompt, add_special_tokens=True, return_tensors="pt"
+        ).to("cuda")
+
+        if method == "SFT":
+            encoded_value = tokenizer.encode(
+                str(label), add_special_tokens=True, return_tensors="pt"
+            ).to("cuda")
+            input_id = (
+                torch.cat([encoded_prompt, encoded_value], dim=-1).squeeze(0).to("cuda")
+            )
+            attn = (
+                torch.cat(
+                    [torch.zeros_like(encoded_prompt), torch.ones_like(encoded_value)],
+                    dim=-1,
+                )
+                .squeeze(0)
+                .to("cuda")
+            )
+            output_id = torch.where(attn == 1, input_id, -100)
+        else:
+            input_id = encoded_prompt.squeeze(0)
+            output_id = torch.tensor(label).unsqueeze(0).to("cuda")
+
+        input_ids.append(input_id)
+        output_ids.append(output_id)
+
+    if method == "PPO":
+        # Left-padding of all sequences to the maximum length
+        # Reverse sequences, pad them, then reverse them back
+        input_ids = [x.flip(dims=[0]) for x in input_ids]
+        output_ids = [x.flip(dims=[0]) for x in output_ids]
+
+        input_ids = pad_sequence(
+            input_ids, batch_first=True, padding_value=tokenizer.eos_token_id
+        )
+        output_ids = pad_sequence(
+            output_ids, batch_first=True, padding_value=tokenizer.eos_token_id
+        )
+
+        input_ids = input_ids.flip(dims=[1])
+        output_ids = output_ids.flip(dims=[1])
+
+    return input_ids, output_ids
+
+
+def get_dataloader_from_dataframe(df, tokenizer, bsz, shuffle=True, method="GFN"):
+    def collate_fn_SFT(batch):
+        input_ids, target_ids = zip(*batch)
+        input_ids = pad_sequence(
+            input_ids, batch_first=True, padding_value=tokenizer.eos_token_id
+        )
+        target_ids = pad_sequence(
+            target_ids, batch_first=True, padding_value=tokenizer.eos_token_id
+        )
+        return input_ids, target_ids
+
+    input_ids, output_ids = get_tensors_from_dataframe(df, tokenizer, method=method)
+    if method == "SFT":
+        dataset = list(zip(input_ids, output_ids))
+        dataloader = DataLoader(
+            dataset, batch_size=bsz, shuffle=shuffle, collate_fn=collate_fn_SFT
+        )
+    else:
+        dataset = list(zip(input_ids, output_ids))
+        dataloader = DataLoader(dataset, batch_size=bsz, shuffle=shuffle)
+
+    return dataloader
+
+
+# def pad_sequences(sequences, padding_value):
+#     max_length = max(len(seq) for seq in sequences)
+#     return [seq + [padding_value] * (max_length - len(seq)) for seq in sequences]
+
+
+def get_train_test_dataloaders(df, tokenizer, bsz):
+    train_df, test_df = split_dataframe(df)
+    train_dataloader = get_dataloader_from_dataframe(
+        train_df, tokenizer, bsz, shuffle=True, method="SFT"
+    )
+    test_dataloader = get_dataloader_from_dataframe(
+        test_df, tokenizer, bsz, shuffle=False, method="SFT"
+    )
+    return train_dataloader, test_dataloader
+
+File Path: rng/rng_plot.py
+Content:
+import matplotlib
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+from IPython.display import display, Markdown
+import re
+import unidecode
+from rng.rng_utils import format_dict
+
+
+def slugify(text):
+    text = unidecode.unidecode(text).lower()
+    return re.sub(r"[\W_]+", "-", text)
+
+
+def plot_distribution(
+    dist,
+    n_max=512 * 8,
+    model_name="Model",
+    color="lightseagreen",
+    xlims=None,
+    number_of_NaNs=0,
+    font="Times New Roman",
+    filename="model"
+):
+    plt.rcParams["font.family"] = font
+
+    display(Markdown(f"## {model_name}: Distribution of generated numbers"))
+
+    sns.set_theme(style="whitegrid", font=font)
+
+    bins = range(min(dist), max(dist) + 2)
+
+    plot = sns.histplot(
+        dist,
+        color=color,
+        linewidth=0,
+        bins=bins,
+        stat="probability"
+    )
+
+    # plot.set_title(
+    #     f"Distribution of generated outcomes ({len(dist)} numbers, {number_of_NaNs} NaNs)"
+    # )
+    plot.set_xlabel("Number")
+    # plot.set_ylabel("Empirical probability")
+    plot.set_ylabel("")
+    
+    if xlims is not None:
+        plot.set_xlim(xlims)
+
+    if not os.path.exists("plots"):
+        os.makedirs("plots")
+    plot.figure.savefig(f"plots/{slugify(model_name)}_{n_max}.pdf", bbox_inches="tight")
+    plt.show()
+
+
+def visualize(df):
+    sns.set_style("whitegrid")
+    for dist in df["Distribution"].unique():
+        for params in df[df["Distribution"] == dist]["Parameters"].unique():
+            subset = df[(df["Distribution"] == dist) & (df["Parameters"] == params)]
+            plt.figure(figsize=(10, 6))
+
+            if (subset["Data Type"] == "int").all():
+                sns.histplot(
+                    subset["Value"], bins=len(subset["Value"].unique()), kde=False
+                )
+            else:
+                sns.histplot(subset["Value"], kde=True)
+
+            plt.title(f"Histogram of {dist} with parameters {format_dict(params)}")
+            plt.xlabel("Value")
+            plt.ylabel("Frequency")
+            plt.tight_layout()
+            plt.show()
+
+
+def plot_kl_divergence(results):
+    for model, datasets in results.items():
+        plt.figure(figsize=(10, 6))
+        names = list(datasets.keys())
+        values = list(datasets.values())
+
+        sns.barplot(x=names, y=values)
+        plt.title(f'KL Divergence for {model}')
+        plt.ylabel('KL Divergence')
+        plt.show()
+File Path: rng/rng_rewards.py
+Content:
+import torch
+
+def scalar_reward(distribution, parameters, value):
+    if "uniform" in distribution:
+        return 1 if parameters["a"] <= value <= parameters["b"] else 0
+    elif distribution == "poisson":
+        λ = parameters["lam"]
+        return λ**value / torch.factorial(value)
+
+    elif distribution == "binomial":
+        n = parameters["n"]
+        p = parameters["p"]
+        binom_coeff = torch.comb(
+            torch.tensor(n, dtype=torch.float64),
+            torch.tensor(value, dtype=torch.float64),
+        )
+        return binom_coeff * (p / (1 - p)) ** value
+
+    elif distribution == "geometric":
+        p = parameters["p"]
+        return (1 - p) ** value
+
+    elif distribution == "gaussian":
+        mean = parameters["mean"]
+        std_dev = parameters["std_dev"]
+        return torch.exp(-0.5 * ((value - mean) / std_dev) ** 2)
+
+    elif distribution == "exponential":
+        scale = parameters["scale"]
+        return torch.exp(-value / scale)
+
+@torch.inference_mode()
+def reward_fn(x, n_max, skip_first=1):
+    # Get the token ids after skip_first
+    token_ids = x[:, skip_first:]
+
+    # print("x ", x)
+
+    if token_ids.shape[1] == 0:
+        return torch.full((x.shape[0],), fill_value=-8).cuda()
+
+    # Initialize rewards to a low value
+    rew = torch.full(token_ids.shape, fill_value=-8).cuda() * torch.arange(
+        1, token_ids.shape[1] + 1, device="cuda"
+    )
+
+    # Create a mask where the first token is in the list of tokenized permitted numbers
+    tokenized_permitted_numbers_mask = tokens_of_numbers[:n_max]
+    first_token_mask = torch.cat(
+        (
+            (token_ids[:, 0].unsqueeze(-1) == tokenized_permitted_numbers_mask)
+            .any(dim=-1)
+            .unsqueeze(-1),
+            torch.zeros(
+                token_ids.shape[0], token_ids.shape[1] - 1, device="cuda"
+            ).bool(),
+        ),
+        dim=-1,
+    )
+
+    # Create a mask where the remaining tokens are the eos_token_id
+    remaining_eos_tokens_mask = torch.cat(
+        (
+            torch.zeros(token_ids.shape[0], 1, device="cuda").bool(),
+            token_ids[:, 1:] == tokenizer.eos_token_id,
+        ),
+        dim=-1,
+    )
+
+    # Set the reward to 8 (resp. 0) where
+    # the token is the first token and in the list of tokenized permitted numbers,
+    # (resp. it is one of the remaining tokens and equal to eos_token_id)
+    rew[first_token_mask] = 8
+    rew[remaining_eos_tokens_mask] = 0
+
+    # return torch.cat((res[:, :1], res), dim=-1)
+    # return torch.cat((rew, rew.new_full((rew.shape[0], 1), 0)), dim=-1).cumsum(dim=-1)
+    return rew.sum(dim=-1)
+File Path: rng/rng_utils.py
+Content:
+import torch
+from tqdm import tqdm
+import json
+
+
+def format_dict(d):
+    if isinstance(d, str):
+        d = json.loads(d)
+    return ", ".join(f"{k}={v}" for k, v in d.items())
+
+
+def number_from_generated_text(generated_text, tokenizer, type_of_number="integer"):
+    eos_string = tokenizer.decode(tokenizer.eos_token_id)
+    convert_func = int if type_of_number == "integer" else float
+    try:
+        return convert_func(tokenizer.decode(generated_text).replace(eos_string, "").rstrip())
+    except ValueError:
+        return None
+
+def get_distribution(
+    inference_model,
+    tokenizer,
+    prompt,
+    eos_token_id=None,
+    num_samples=32 * 512,
+    num_samples_per_batch=512,
+    max_len=30,
+    temperature=1,
+    type_of_number="integer",
+):
+    generated_numbers = []
+    len_prompt = len(tokenizer.encode(prompt))
+
+    if eos_token_id is None:
+        eos_token_id = tokenizer.eos_token_id
+
+    number_of_NaNs = 0
+
+    inference_model.eval()
+    with torch.inference_mode():
+        encoded_test_query = tokenizer(prompt, return_tensors="pt").to("cuda")
+
+        for _ in tqdm(range(num_samples // num_samples_per_batch)):
+            generated_outputs = inference_model.generate(
+                **encoded_test_query,
+                max_new_tokens=max_len,
+                temperature=temperature,
+                pad_token_id=eos_token_id,
+                num_return_sequences=num_samples_per_batch,
+                do_sample=True,
+            )
+
+            generated_numbers_batch = []
+            for generated_output in generated_outputs:
+                generated_number = number_from_generated_text(
+                    generated_output[len_prompt:], 
+                    tokenizer,
+                    type_of_number=type_of_number,
+                )
+                if generated_number is None:
+                    number_of_NaNs += 1
+                else:
+                    generated_numbers_batch.append(generated_number)
+
+            generated_numbers.extend(generated_numbers_batch)
+    return (generated_numbers, number_of_NaNs)
+
+
+def generate(model, encoded_prompt, eos_token_id, max_len=10, temperature=1., vocab_nice_mask=None,vocab_alpha=-99):
+    active_seqs = torch.ones(encoded_prompt.size(0)).bool().to(encoded_prompt.device)
+    logPF = encoded_prompt.new_zeros(encoded_prompt.size(0)).float()
+    actions = encoded_prompt.clone()
+    state = encoded_prompt.clone()
+    past_key_values = model(state[:, :-1])['past_key_values']
+    for _ in range(max_len):
+        output = model(state[:, -1:], past_key_values=past_key_values)
+        past_key_values = output['past_key_values']
+        with torch.inference_mode():
+            prob = (output['logits'][:, -1, :]).softmax(dim=-1)
+            modified_logits = output['logits'][:, -1, :].clone()
+            if vocab_nice_mask is not None:
+                # add vocab_alpha to the logits of the unmasked vocab items
+                modified_logits[:, ~vocab_nice_mask] += vocab_alpha
+            prob = (modified_logits/temperature).softmax(dim=-1)
+            token_ids = torch.multinomial(prob, num_samples=1)
+        token_ids = torch.where(active_seqs.unsqueeze(-1), token_ids, torch.ones_like(token_ids) * eos_token_id)
+        logprob = output['logits'][:, -1, :].log_softmax(dim=-1)
+        logPF += logprob.gather(-1, token_ids).squeeze(-1)
+        actions = torch.cat([actions, token_ids], dim=-1)
+        state = torch.cat([state, token_ids], dim=-1)
+        # check if all sequences have generated eos
+        active_seqs = active_seqs * (token_ids != eos_token_id).squeeze(-1)
+        if torch.all(~active_seqs):
+            break
+    return actions, logPF, state
+
+def generate_and_return_eos_logprob(model, encoded_prompt, eos_token_id, reward_fn, vocab_nice_mask=None,
+                                    vocab_alpha=-99, max_len=10, min_len=0,
+                                    temperature=1., action_seq=None, skip_rewards=False):
+    # generate and return the probability of generating eos at every step
+    active_seqs = torch.ones(encoded_prompt.size(0)).bool().to(encoded_prompt.device)
+    actions = encoded_prompt.clone()
+    state = encoded_prompt.clone()
+    logpf = encoded_prompt.new_zeros(encoded_prompt.size(0), max_len+1).float()
+    logeosprobs = encoded_prompt.new_zeros(encoded_prompt.size(0), max_len+1).float()
+    logrewards = encoded_prompt.new_zeros(encoded_prompt.size(0), max_len+1).float()
+    if not skip_rewards:
+        logrewards[:, 0] = reward_fn(state)
+    past_key_values = model(state[:, :-1])['past_key_values']
+    for i in range(max_len):
+        output = model(state[:, -1:], past_key_values=past_key_values)
+        past_key_values = output['past_key_values']
+        if action_seq is None:
+            with torch.inference_mode():
+                prob = (output['logits'][:, -1, :]).softmax(dim=-1)
+                modified_logits = output['logits'][:, -1, :].clone().detach()
+                # if we haven't reach the minimum length, set the probability of generating eos to 0
+                if i < min_len:
+                    modified_logits[:, eos_token_id] = -float('inf')
+                if vocab_nice_mask is not None:
+                    # add vocab_alpha to the logits of the unmasked vocab items
+                    modified_logits[:, ~vocab_nice_mask] += vocab_alpha
+                prob = (modified_logits/temperature).softmax(dim=-1)
+                token_ids = torch.multinomial(prob, num_samples=1)
+        else:
+            if i >= action_seq.size(-1):
+                token_ids = (torch.ones_like(action_seq[:, 0]) * eos_token_id).unsqueeze(-1)
+            else:
+                token_ids = action_seq[:, i].unsqueeze(-1)
+        token_ids = torch.where(active_seqs.unsqueeze(-1), token_ids, torch.ones_like(token_ids) * eos_token_id)
+        modified_logits = output['logits'][:, -1, :]
+        if vocab_nice_mask is not None:
+            modified_logits[:, ~vocab_nice_mask] += vocab_alpha
+        logprob = modified_logits.log_softmax(dim=-1)
+        logpf[:, i] = torch.where(active_seqs, logprob.gather(-1, token_ids).squeeze(-1), 0)
+        logeosprobs[:, i] = torch.where(active_seqs, logprob[:, eos_token_id], 0)
+        actions = torch.cat([actions, token_ids], dim=-1)
+        state = torch.cat([state, token_ids], dim=-1)
+        if not skip_rewards:
+            logrewards[:, i+1] = torch.where(active_seqs, reward_fn(actions), 0)
+        # check if all sequences have generated eos
+        active_seqs = active_seqs * (token_ids != eos_token_id).squeeze(-1)
+        if torch.all(~active_seqs):
+            break
+    # add eos to the end of the sequence
+    actions = torch.cat([actions, actions.new_ones(actions.size(0), 1)*eos_token_id], dim=-1)
+    logpf[:, -1] = 0
+    logeosprobs[:, -1] = 0
+    return actions, logpf, logeosprobs, logrewards
+
+
+def remove_eos_and_pad_left(text : torch.Tensor, eos_token_id : int, pad_token_id : int):
+    """
+    remove anything after the first eos token, and left pad sequences"""
+    stripped_text = []
+    lens = []
+    position_ids = []
+    for t in text:
+        if eos_token_id not in t:
+            stripped_text.append(t)
+            position_ids.append(torch.arange(t.size(-1)))
+            lens.append(t.size(-1))
+            continue
+        # find the first eos token
+        t[(t == eos_token_id).cumsum(dim=-1) >= 1] = eos_token_id
+        eos_ind = ((t == eos_token_id).cumsum(dim=-1) == 1).nonzero()[0]
+        stripped_text.append(t[:eos_ind])
+        lens.append(eos_ind)
+        position_ids.append(torch.arange(eos_ind.item()))
+    left_pad_seqs = torch.nn.utils.rnn.pad_sequence([i.flip(0) for i in stripped_text], batch_first=True, padding_value=pad_token_id).flip(dims=[1]) 
+    left_pad_position_ids = torch.nn.utils.rnn.pad_sequence([i.flip(0) for i in position_ids], batch_first=True, padding_value=0).flip(dims=[1])
+    return left_pad_seqs, left_pad_position_ids, torch.tensor(lens)
+Output:
+{
+    "experimental_code": "infll_subj_arithmetic/eval_arithmetic.py",
+    "experimental_info": "The `test` function in `eval_arithmetic.py` evaluates the model's accuracy. It takes the configuration, model, tokenizer, vocabulary list, dataset, EOS token ID, pad token ID, current step, and maximum evaluation length as input. It uses the `run_evaluation` utility to compute accuracy and identify incorrect examples, saving the latter to a file. The function returns the accuracy score."
+}
