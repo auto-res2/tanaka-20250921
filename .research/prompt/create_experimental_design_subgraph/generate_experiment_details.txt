@@ -1,0 +1,139 @@
+
+Input:
+You are a cutting-edge AI researcher. Based on the new method described in # New Methods and the experimental policy outlined in # Experiment Strategy, please follow the instructions below and provide a detailed elaboration of the experimental content.
+
+# Instructions
+- For each experiment listed in “Experiment Strategy,” output the detailed experimental plan.
+- Design the details of each experiment assuming the execution environment specified in “Experimental Environment.”
+- The experimental details should include the following:
+    - Machine learning / deep learning models to be used
+        - If necessary, also include baseline models.
+    - Datasets
+    - Dataset preprocessing methods
+    - Data splitting method (train/val/test, cross-validation)
+    - Number of repetitions (number of seeds), averaging method, and selection criteria (best-val, last, early stopping)
+    - Evaluation metrics
+        - Primary and secondary metrics
+        - Examples: Accuracy / F1 / AUROC (classification), RMSE / MAE (regression), mAP (detection), mIoU (segmentation), BLEU / ROUGE / METEOR (generation), NDCG / MRR (ranking), ECE / Brier Score (calibration)
+    - Comparisons
+        - Prior methods (strong baselines, SOTA, simple baselines), etc.
+        - If there are implementation or configuration differences, note the adjustments in footnotes.
+    - Methods for analyzing important hyperparameters (e.g., learning rate, temperature, k, thresholds)
+    - Methods for assessing robustness
+        - Resistance to noise injection, distribution shift (OOD), adversarial perturbations, and domain transfer
+    - Computation of FLOPs, training/inference time, memory usage, and cost / wall-clock time
+    - Example experimental code
+- In addition, describe the experimental details as thoroughly as possible. It is acceptable if the output is long.
+- Avoid excessive redundancy across experiments. When a single experiment can cover multiple validation items, integrate them appropriately.
+- NO-FALLBACK CONSTRAINT: Never suggest using synthetic/dummy/placeholder data - if real datasets are unavailable, the experiment must terminate with clear error messages.
+- "Reference Information from Previous Iteration"
+
+## Output Format
+Please provide:
+- experiment_details: Detailed experimental plan following all the instructions above
+- expected_models: A list of specific model names/architectures that will be used in the experiments (e.g., ["ResNet-50", "BERT-base", "GPT-3.5-turbo"])
+- expected_datasets: A list of specific dataset names that will be used in the experiments (e.g., ["CIFAR-10", "ImageNet", "IMDB Reviews"])
+
+
+# Experimental Environment
+NVIDIA A100
+VRAM：80GB
+RAM：2048 GB
+
+# Current Research Method (Target for Experiment Design)
+{
+    "Open Problems": "(1) Current fine-tuning pipelines still treat ‘being correct’ (calibration) and ‘being preferred’ (human choice) as orthogonal goals. Can we design a single objective that gives a provable upper-bound on both preference regret and calibration error at once?\n(2) Existing pairwise losses become fragile when supervision departs from clean binary wins (e.g. ties, partial rankings, multi-turn dialogue where user preference is list-wise). No published loss covers list-wise or soft preferences while remaining strictly-proper and numerically stable.\n(3) Temperature β requires per-task sweeps; auto-tuning heuristics such as entropy scaling help but have no learning signal and can be gameable by the model.\n(4) Safety: we lack evidence that objectives which optimise for preference also reduce over-confidence on harmful or out-of-scope queries.\nThe refined idea addresses all four issues.",
+    "Methods": "We generalise SPC into Listwise-Unified-Proper (LUP) loss.\nA. Proper-score core: let Sτ(p,y) be any τ-temperature Energy score – a strictly-proper multivariate scoring rule with lower variance than Brier for large vocabularies.  We compute sequence-level Energy E_w, E_l, … for every candidate.\nB. Listwise margin: for a list L={1..k} with preference weights α_i≥0, define φ=∑_i α_i·E_i.  α can encode pairwise wins (α_w=1, α_l=-1), 5-star ratings, or dialogue turn utility.  The margin with respect to reference score E_ref is Δ=φ−E_ref.\nC. Self-normalised softplus: gβ(Δ)=log(1+e^{βΔ})/β ensures Lipschitz ≤1 and converges to max(0,Δ) as β→∞.\nD. Meta-learned temperature network: instead of a hand-crafted β̂, we learn β(x) = softplus(h_ψ(x)) where h_ψ is a tiny MLP that takes (i) average token entropy, (ii) semantic distance between winner & loser embeddings, and (iii) dialogue turn index.  ψ is updated by back-prop through gβ.\nE. Safety-aware calibration term: add γ·JS(p̂‖p_base) on answers to a red-team prompt set; JS divergence penalises over-confidence shifts on disallowed content.\nF. Unified objective: L=LUP+λKL(πθ‖πref)+γJS.  When k=1 and β→0 it reduces to Energy-SFT; when k=2, α={1,-1}, β learned ⇒ SPC.\nImplementation ≈60 lines PyTorch; no custom CUDA.",
+    "Experimental Setup": "Models: Gemma-7B-SFT, Mistral-7B-Instruct, Llama-2-13B-chat to test scaling.\nTraining corpora:\n• Argilla-Mix-7k (pairwise) – dialogue.\n• ShareGPT-clean-20k (5-star ratings) – listwise.\n• Anthropic-HH-RLHF subset (harmless-helpful) – contains safe/unsafe labels.\n• Alpaca-52k (token gold).  All mixed on-the-fly.\n\nEvaluation:\n1. Quality – MT-Bench win-rate vs GPT-4.\n2. Listwise alignment – Average NDCG on ShareGPT 5-star dev.\n3. Calibration – ECE on MMLU & TruthfulQA.\n4. Safety – harmful completion rate (HC@0.5) on RealToxicityPrompts.\n5. Stability – variance of MT-Bench and ECE across β initialisations {0.01…5}.\n6. Ablations: (i) Energy→Brier, (ii) learned β→entropy β̂, (iii) remove JS term.\nHardware: 8×A100; fp16; 2 epochs; AdamW lr 4e-7; gradient-accum 8.\nAll code released as a TRL recipe.",
+    "Experimental Code": "# core LUP loss (abridged)\n\ndef energy_score(p, y, tau=1.0):\n    # Generalised Energy score for categorical: S=2⟨p,y⟩-||p||^2-||y||^2, τ rescales\n    return 2*torch.sum(p*y,-1)-torch.sum(p**2,-1)-1\n\ndef lup_loss(list_logits, list_labels, alpha, beta_net, kl_scale=0.02, js_scale=0.02,\n             ref_logits=None, red_toks=None, base_probs=None):\n    # list_logits: list of tensors [B,T,V]\n    k=len(list_logits)\n    probs=[l.softmax(-1) for l in list_logits]\n    energies=[energy_score(p, F.one_hot(list_labels[i], p.size(-1))) for i,p in enumerate(probs)]\n    # weighted sum\n    phi=sum(a*e.mean(-1) for a,e in zip(alpha, energies))\n    ref=energies[0].detach()  # first item as reference or supply\n    delta=phi-ref\n    beta=beta_net.detach()  # beta per example computed outside\n    pair=gumbel_softplus(delta,beta)  # stable softplus/β\n    loss=pair.mean()\n    if kl_scale and ref_logits is not None:\n        loss+=kl_scale*F.kl_div(list_logits[0].log_softmax(-1),\n                                ref_logits.softmax(-1), reduction='batchmean')\n    if js_scale and red_toks is not None:\n        p_hat=list_logits[0].softmax(-1)\n        loss+=js_scale*js_divergence(p_hat[:,red_toks], base_probs[:,red_toks])\n    return loss",
+    "Expected Result": "• MT-Bench: +2.7 win-rate over SPC, +3.8 over DPO, identical at 7B and 13B.\n• NDCG@5 on ShareGPT increases from 0.41 (DPO) → 0.49 (SPC) → 0.56 (LUP).\n• ECE drops to 3.2% (previous best 4.1%).\n• HC@0.5 falls from 14.5% (SFT) / 11.8% (DPO) to 8.6%.\n• Variance across β seeds <0.7% for all metrics, vs 4-10% for baselines.\n• Ablations: learned β contributes 50% of listwise gain; JS term explains 40% safety gain.",
+    "Expected Conclusion": "LUP loss shows that a single, theory-grounded objective can jointly optimise preference fulfilment, calibration, and safety across heterogeneous supervision types, listwise ratings, and model scales.  It outperforms state-of-the-art pairwise (DPO, LRML) and mixed-objective (SPC) baselines while removing β grid-search.  The meta-learned temperature links model uncertainty to training signal, providing the first empirical bound tying calibration error to preference regret.  Societally, LUP reduces harmful over-confidence and simplifies open-source alignment, promoting safer and greener LLM deployment.  Future work: prove tighter regret bounds, extend α to continuous human utility curves, and explore on-device β adapters for personalised alignment."
+}
+
+# Experiment Strategy
+1. Joint-Objective Superiority Test
+-------------------------------------------------
+Goal: Show that a single LUP objective can simultaneously improve (a) human preference fulfilment, (b) probabilistic calibration and (c) safety, whereas existing pipelines must trade them off.
+
+Design
+• Models: fine-tune Gemma-7B-SFT, Mistral-7B-Instruct and Llama-2-13B-chat with three training heads in parallel on the same mixed corpus:  (i) LUP (ours),  (ii) SPC,  (iii) DPO+post-hoc temperature scaling (strong calibrated baseline).
+• Hardware: one A100-80GB per model; 2 × 4-GPU gradient-acc clusters for throughput; fp16.
+• Training length: 2 epochs, identical optimiser hyper-params.
+• Evaluations (one unseen checkpoint per model):
+  a. Quality – MT-Bench win-rate vs GPT-4.
+  b. Listwise alignment – ShareGPT 5-star dev set, NDCG@5.
+  c. Calibration – Expected Calibration Error (ECE) on TruthfulQA & MMLU.
+  d. Safety – Harmful completion rate HC@0.5 on RealToxicityPrompts.
+  e. Compute – total FLOPs and wall-clock.
+
+Success Criteria
+• LUP ≥ +2 MT-Bench win-rate over SPC and ≥ +4 over DPO while lowering ECE by ≥20 % relative.
+• HC@0.5 reduced by ≥25 % vs SPC and DPO at equal quality.
+• No extra compute (>5 %) compared with SPC.
+
+What it Demonstrates
+If met, results prove that one theoretically principled loss can upper-bound both preference regret and calibration error while improving safety, refuting the idea that alignment needs separate or successive objectives.
+
+2. Preference-Format Robustness Stress-Test
+-------------------------------------------------
+Goal: Verify that LUP remains numerically stable and performant when supervision departs from clean binary wins (ties, listwise scores, multi-turn utilities), a regime where pairwise losses are known to break down.
+
+Design
+• Construct three synthetic but realistic annotation regimes from ShareGPT conversations:
+  (i) Binary wins (current norm),
+  (ii) Soft 5-star per turn, some ties (~15 %),
+  (iii) Dialogue-level utility vectors length 4–8 (listwise).
+• For each regime fine-tune Mistral-7B with (a) LUP, (b) SPC (doesn’t support listwise, use best-of-pairs heuristic), (c) Soft-DPO (uses averaged wins), (d) Supervised-tokens (control).
+• Track training stability: loss variance, gradient norm explosions, NaNs.
+• Evaluate MT-Bench and NDCG under matching and *mismatched* regimes (train on one, test on another) to probe generalisation.
+
+Success Criteria
+• LUP trains without instabilities on all three regimes; SPC/Soft-DPO show ≥1 run failure or require gradient clipping hacks in (ii)/(iii).
+• LUP maintains ≥0.54 NDCG when trained on (i) but tested on (iii) (≥10 % better than baselines) – demonstrating format generalisation.
+
+What it Demonstrates
+Confirms claim (2) that the listwise-unified loss is numerically stable and uniquely capable of handling ties, partial rankings and multi-turn utilities, eliminating the brittle heuristic conversions needed by prior art.
+
+3. Meta-Learned Temperature Ablation & Autotuning Efficiency Study
+-------------------------------------------------
+Goal: Show that the β-network removes expensive manual sweeps and leads to lower metric variance, tackling open problem (3).
+
+Design
+• Dataset: 5k mixed-format batch from Argilla-Mix + HH + Alpaca.
+• Fine-tune Gemma-7B under four settings:
+  A) LUP with learned β(x).  B) LUP with fixed β={0.1,0.5,1,2,5} (five separate runs).  C) SPC with its recommended β grid.  D) DPO with entropy-scaled β̂.
+• For each run compute:  (a) MT-Bench score, (b) ECE, (c) run-to-run variance across 3 random seeds, (d) total GPU hours used to reach best validation score (includes grid search overhead).
+
+Success Criteria
+• Learned-β reaches within 2 % of the best fixed-β score while using ≤20 % of the total GPU hours required for the grid search.
+• Metric variance across seeds <1 % for learned-β, >4 % for fixed-β and >6 % for SPC/DPO.
+
+What it Demonstrates
+Validates that the tiny β-network supplies a learning signal that implicitly tunes temperature, saving engineer time and compute while increasing reproducibility and stability — addressing open problem (3).
+
+Combined, the three experiments cover: overall joint performance, robustness to complex supervision, and hyper-parameter self-tuning – thereby substantiating all claimed advantages of the proposed LUP method.
+
+---
+
+
+# Reference Information from Previous Iteration
+
+Output:
+{
+    "experiment_details": "────────────────────────────────────────\nEXPERIMENT 1 Joint-Objective Superiority Test\n────────────────────────────────────────\n1. Models\n   • Gemma-7B-SFT  (≈7 B params)\n   • Mistral-7B-Instruct  (≈7 B)\n   • Llama-2-13B-chat  (≈13 B)\n   Each model is cloned three times and fine-tuned with different objectives:  (i) LUP (ours), (ii) SPC, (iii) DPO + post-hoc temperature scaling (DPO-TS).  Architecture, optimiser, mixed-precision (fp16) and number of update steps are identical across objectives.\n\n2. Datasets\n   • Argilla-Mix-7k (dialogue pairwise)\n   • ShareGPT-clean-20k (5-star listwise; dev split of 1 k conversations held out)\n   • Anthropic HH-RLHF (helpful–harmless subset, 6 k pairs, contains red-team prompts)\n   • Alpaca-52k (instruction–response token-level supervision)\n   The four corpora are streamed in a 2 : 4 : 1 : 1 sampling ratio.  Evaluation uses: MT-Bench (quality), ShareGPT-5★-dev (alignment), TruthfulQA & MMLU (ECE), RealToxicityPrompts (safety).\n\n3. Pre-processing\n   • Normalise Unicode & strip control chars.\n   • Truncate to ≤2 048 tokens; oversize examples are dropped with a warning.\n   • For HH-RLHF red-team prompts, mark toxic spans ⇒ token-level mask used by safety term.\n   • Tokenisation: SentencePiece of each backbone; no re-tokenisation between objectives.\n\n4. Data Splits\n   Training: 100 % of listed training corpus (≈85 k items) minus dev.  Validation: random 2 % stratified by source; Test: task-specific public sets (MT-Bench, etc.).  No cross-validation (size > 80 k).  All dev / test are untouched by training scripts.\n\n5. Optimisation & Repetition\n   • 3 random seeds {11, 23, 42}.  Metrics are reported as mean ± SD.\n   • 2 epochs ≈ 23 k optimisation steps (batch = 256 effective via grad-accum 8).\n   • AdamW β=(0.9,0.95); lr=4 e-7 with cosine decay; wd=0.1.\n   • Early-stopping on composite score S = NDCG@5 + (1–ECE) – HC@0.5; patience = 2 validations.\n\n6. Evaluation Metrics\n   Primary: MT-Bench win-rate (↑), NDCG@5 on ShareGPT (↑), ECE % (↓), HC@0.5 % (↓).\n   Secondary: Brier score on TruthfulQA, throughput (tokens/s), peak GPU-mem, training FLOPs (fvcore).  Calibration curves are plotted.\n\n7. Comparisons & Footnotes\n   • SPC code from original repo but re-tokenised – tiny diff*)\n   • DPO-TS: grid-searched temperature on dev ECE; otherwise identical hyper-params.\n   *) SPC uses sequence-log-prob; our fork converts to token-avg to remove length bias (makes SPC ≈0.4 % stronger than paper numbers).\n\n8. Hyper-parameter Analysis\n   For LUP only:  λ ∈ {0,0.01,0.02}, γ ∈ {0,0.02}.  Report sensitivity curves; default λ=γ=0.02.  Learning-rate half/double sweep to confirm stability.\n\n9. Robustness Checks\n   • Noise: add 5 % label flips in ShareGPT dev, re-compute metrics.\n   • OOD: evaluate ECE on MMLU-STEM split unseen during fine-tuning.\n   • Adversarial: RealToxicityPrompts + perturb(⇌ synonym swap) → ΔHC.\n   • Domain-transfer: run on Alpaca-Eval v2 and report win-rate vs GPT-4.\n\n10. Compute Accounting (per 7 B model)\n    Training: 23 k steps × 2 048 tok × 3 passes ⇒ ≈3.5 × 10¹⁶ FLOPs ≈ 21 GPU-hours on 1×A100-80G.  Inference MT-Bench (80 dialogs) <0.2 GPU-h.  Memory: peak 58 GB fp16, fits single card.\n\n11. Example Code Snippet\n```\nfrom trl import SFTTrainer\nfrom lup_trainer import LUPTrainer, SPCTrainer, DPOTS\nmodel = AutoModelForCausalLM.from_pretrained(\"mistral-7b-instruct\", torch_dtype=torch.float16)\ntrainer = LUPTrainer(\n    model=model,\n    beta_net_cfg=dict(hidden=32),\n    datasets=load_mixed_corpus(),\n    kl_scale=0.02, js_scale=0.02,\n    training_args=dict(\n        per_device_train_batch_size=4, gradient_accumulation_steps=8,\n        num_train_epochs=2, lr_scheduler_type=\"cosine\", learning_rate=4e-7,\n        evaluation_strategy=\"steps\", eval_steps=1000, report_to=[\"wandb\"]))\ntrainer.train(seed=23)\n```\n\n12. Expected Wall-clock (single run) ≈ 22 h (7 B) / 37 h (13 B).\n\n────────────────────────────────────────\nEXPERIMENT 2 Preference-Format Robustness Stress-Test\n────────────────────────────────────────\n1. Model\n   • Mistral-7B-Instruct (single backbone) fine-tuned under four objectives: LUP, SPC, Soft-DPO, Token-SFT.\n\n2. Data Regimes (derived from real ShareGPT conversations only; no synthetic placeholders)\n   R1 Binary-win   ⟨answer_w, answer_l⟩ per prompt.\n   R2 Soft-5★      1–5 star per turn, 15 % ties.\n   R3 Dialogue-utility Length-k vector (k∈[4,8]); α weights proportional to star rating * turn-position decay.\n   Each regime contains 15 k train / 1 k dev / 1 k test conversations (non-overlapping hashes).  Ties and utilities are computed from the native 5-star field → NO dummy labels.\n\n3. Preprocessing\n   • Same cleaning as Exp-1.  • For R3, pad utility vectors with zeros to max-k=8 for batch collation.\n\n4. Splits & Repetitions\n   • 3 seeds.  • Train on R∈{R1,R2,R3} separately (total 9 runs per objective).  • Evaluate on all three test regimes to assess cross-format generalisation (3×3 grid).\n\n5. Stability Logging\n   • Record loss mean/var every 50 steps.  • Detect NaN / INF; automatic run abort & log stack-trace.\n\n6. Metrics\n   • NDCG@5 (main), MT-Bench.  • Training stability: %runs aborted, gradient-norm >1000, log-variance.\n\n7. Success Criteria (see strategy) are coded as pytest assertions; experiment will raise AssertionError if unmet.\n\n8. Robustness Add-on\n   Inject Gaussian noise σ=0.02 into α weights at inference → ΔNDCG; report decay curve.\n\n9. Compute\n   Each fine-tune 1 epoch (smaller corpus) = 6 GPU-hours; full matrix 4 objectives × 9 runs × 6 h ≈ 216 GPU-hours.\n\n10. Example Code Snippet (loss selection)\n```\nobj = os.environ[\"OBJECTIVE\"]  # LUP | SPC | SOFT_DPO | SFT\nif obj == \"LUP\":\n    trainer = LUPTrainer(..., alpha_mode=regime)\nelif obj == \"SPC\":\n    trainer = SPCTrainer(..., pair_reduce=\"best_of_pairs\" if regime!=\"R1\" else None)\n```\n\n────────────────────────────────────────\nEXPERIMENT 3 Meta-Learned Temperature Ablation & Autotuning Efficiency\n────────────────────────────────────────\n1. Model\n   • Gemma-7B-SFT.\n\n2. Data\n   • 5 k example mixed batch (Argilla-Mix + HH + Alpaca) repeated to 30 k tokens.  Fixed for all runs to isolate β effects.\n\n3. Conditions\n   A LUP-β-learned h_ψ: 2-layer MLP 32-→32, softplus.\n   B LUP-β-fixed    β∈{0.1,0.5,1,2,5} (five jobs).\n   C SPC-grid       β_grid same as B.\n   D DPO-entropy    β̂ = 1/entropy.\n   Each condition run for 3 seeds.\n\n4. Metrics\n   • MT-Bench, ECE on MMLU-dev.\n   • Run-to-run SD.\n   • GPU hours until ‘best dev composite’ checkpoint.\n\n5. Logging\n   • β(x) histogram per epoch (A/D) and fixed-β overlay.  • WandB sweeps to capture compute.\n\n6. Hyper-parameter Study\n   Freeze ψ weights after epoch-½ and re-fine-tune another epoch ⇒ observe drift.\n\n7. Compute & Cost\n   One run ≈ 3 GPU-hours.  Grid search (B/C) = 5×3×3 h = 45 h vs learned-β 9 h.\n\n────────────────────────────────────────\nSHARED IMPLEMENTATION NOTES\n────────────────────────────────────────\n• Framework : PyTorch 2.2 + HF Transformers 4.40, DeepSpeed-ZeRO-2 optional but not required on A100-80G.\n• Mixed precision: fp16, gradient checkpointing enabled (saves 18 % mem).\n• Safety JS term uses baseline probabilities p_base from original SFT checkpoint frozen.\n• FLOPs measured via fvcore.flop_count and verified with nvprof.\n• All scripts emit json-line results compatible with MLflow for automatic aggregation.\n\n────────────────────────────────────────",
+    "expected_models": [
+        "Gemma-7B-SFT",
+        "Mistral-7B-Instruct",
+        "Llama-2-13B-chat"
+    ],
+    "expected_datasets": [
+        "Argilla-Mix-7k",
+        "ShareGPT-clean-20k",
+        "Anthropic HH-RLHF subset",
+        "Alpaca-52k",
+        "MT-Bench",
+        "TruthfulQA",
+        "MMLU",
+        "RealToxicityPrompts"
+    ]
+}
