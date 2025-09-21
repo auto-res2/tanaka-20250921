@@ -1,0 +1,13 @@
+model_name: "unsloth/mistral-7b-instruct-v0.3-bnb-4bit"
+loss_type: "lup"          # run separate jobs per loss_type as needed
+num_epochs: 2
+per_device_batch_size: 4
+learning_rate: 4e-7
+early_stop_patience: 2
+kl_scale: 0.02
+js_scale: 0.02
+mixture_ratios:
+  "argilla/dpo-mix-7k": 2
+  "joecodecreations/alpaca_data_52k": 1
+  "HuggingFaceH4/ShareGPT_cleaned": 4
+  "Anthropic/hh-rlhf": 1
