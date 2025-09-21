@@ -1,0 +1,52 @@
+Traceback (most recent call last):
+  File "/home/toma/pt-80-1-a-13/_work/tanaka-20250921/tanaka-20250921/.venv/lib/python3.11/site-packages/transformers/tokenization_utils_base.py", line 2316, in _from_pretrained
+    tokenizer = cls(*init_inputs, **init_kwargs)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/toma/pt-80-1-a-13/_work/tanaka-20250921/tanaka-20250921/.venv/lib/python3.11/site-packages/transformers/models/llama/tokenization_llama_fast.py", line 154, in __init__
+    super().__init__(
+  File "/home/toma/pt-80-1-a-13/_work/tanaka-20250921/tanaka-20250921/.venv/lib/python3.11/site-packages/transformers/tokenization_utils_fast.py", line 133, in __init__
+    slow_tokenizer = self.slow_tokenizer_class(*args, **kwargs)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/toma/pt-80-1-a-13/_work/tanaka-20250921/tanaka-20250921/.venv/lib/python3.11/site-packages/transformers/models/llama/tokenization_llama.py", line 171, in __init__
+    self.sp_model = self.get_spm_processor(kwargs.pop("from_slow", False))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/toma/pt-80-1-a-13/_work/tanaka-20250921/tanaka-20250921/.venv/lib/python3.11/site-packages/transformers/models/llama/tokenization_llama.py", line 203, in get_spm_processor
+    model_pb2 = import_protobuf(f"The new behaviour of {self.__class__.__name__} (with `self.legacy = False`)")
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/toma/pt-80-1-a-13/_work/tanaka-20250921/tanaka-20250921/.venv/lib/python3.11/site-packages/transformers/convert_slow_tokenizer.py", line 37, in import_protobuf
+    from sentencepiece import sentencepiece_model_pb2
+  File "/home/toma/pt-80-1-a-13/_work/tanaka-20250921/tanaka-20250921/.venv/lib/python3.11/site-packages/sentencepiece/sentencepiece_model_pb2.py", line 5, in <module>
+    from google.protobuf.internal import builder as _builder
+ModuleNotFoundError: No module named 'google'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/toma/pt-80-1-a-13/_work/tanaka-20250921/tanaka-20250921/src/main.py", line 31, in <module>
+    main()
+  File "/home/toma/pt-80-1-a-13/_work/tanaka-20250921/tanaka-20250921/src/main.py", line 27, in main
+    launch_training(cfg, smoke=args.smoke_test)
+  File "/home/toma/pt-80-1-a-13/_work/tanaka-20250921/tanaka-20250921/src/train.py", line 335, in launch_training
+    trainer = FineTuner(cfg, smoke=smoke)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/toma/pt-80-1-a-13/_work/tanaka-20250921/tanaka-20250921/src/train.py", line 154, in __init__
+    self.tokenizer = AutoTokenizer.from_pretrained(cfg["model_name"], use_auth_token=os.getenv("HF_TOKEN"))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/toma/pt-80-1-a-13/_work/tanaka-20250921/tanaka-20250921/.venv/lib/python3.11/site-packages/transformers/models/auto/tokenization_auto.py", line 1125, in from_pretrained
+    return tokenizer_class.from_pretrained(pretrained_model_name_or_path, *inputs, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/toma/pt-80-1-a-13/_work/tanaka-20250921/tanaka-20250921/.venv/lib/python3.11/site-packages/transformers/tokenization_utils_base.py", line 2070, in from_pretrained
+    return cls._from_pretrained(
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/toma/pt-80-1-a-13/_work/tanaka-20250921/tanaka-20250921/.venv/lib/python3.11/site-packages/transformers/tokenization_utils_base.py", line 2317, in _from_pretrained
+    except import_protobuf_decode_error():
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/toma/pt-80-1-a-13/_work/tanaka-20250921/tanaka-20250921/.venv/lib/python3.11/site-packages/transformers/tokenization_utils_base.py", line 87, in import_protobuf_decode_error
+    raise ImportError(PROTOBUF_IMPORT_ERROR.format(error_message))
+ImportError: 
+ requires the protobuf library but it was not found in your environment. Check out the instructions on the
+installation page of its repo: https://github.com/protocolbuffers/protobuf/tree/master/python#installation and follow the ones
+that match your environment. Please note that you may need to restart your runtime after installation.
+
