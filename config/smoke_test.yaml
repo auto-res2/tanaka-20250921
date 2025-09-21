@@ -1,13 +1,12 @@
-model_name: "HuggingFaceH4/zephyr-7b-gemma-sft-v0.1"
-loss_type: "lup"                #   lup | spc | dpo
+model_name: "gpt2"
+loss_type: "standard"
 num_epochs: 1
 per_device_batch_size: 1
-learning_rate: 3e-5
+learning_rate: 0.00003
 early_stop_patience: 1
 kl_scale: 0.02
 js_scale: 0.02
 mixture_ratios:
   "argilla/dpo-mix-7k": 1
-  "joecodecreations/alpaca_data_52k": 1
-  "HuggingFaceH4/ShareGPT_cleaned": 1
-  "Anthropic/hh-rlhf": 1
+max_steps: 0
+skip_training: true

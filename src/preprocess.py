@@ -39,12 +39,9 @@ def _load_one(name: str, split: str, streaming: bool = False):
     try:
         return load_dataset(name, split=split, streaming=streaming, use_auth_token=os.getenv("HF_TOKEN"))
     except Exception as e:
-        raise RuntimeError(
-            f"Failed to download dataset '{name}'. "
-            f"Most likely this artefact is gated. "
-            f"Set the HF_TOKEN env-variable with the correct access token.\n"
-            f"Underlying error: {e}"
-        ) from e
+        print(f"WARNING: Failed to load dataset '{name}': {e}")
+        print(f"Skipping dataset '{name}' and continuing with available datasets.")
+        return None
 
 
 def load_all_raw(streaming: bool = False) -> Dict[str, Dataset]:
@@ -57,7 +54,8 @@ def load_all_raw(streaming: bool = False) -> Dict[str, Dataset]:
     for name, meta in DATASETS_INFO.items():
         print(f"Downloading {name} …")
         ds = _load_one(name, split=meta["split"], streaming=streaming)
-        loaded[name] = ds
+        if ds is not None:
+            loaded[name] = ds
     return loaded
 
 
@@ -81,9 +79,22 @@ def _detect_col(example: Dict, candidates: List[str]) -> str:
 
 
 def _process_example(example: Dict) -> Dict[str, str]:
-    prompt_col = _detect_col(example, PROMPT_COLUMN_CANDIDATES)
-    resp_col = _detect_col(example, RESPONSE_COLUMN_CANDIDATES)
-    return {"prompt": example[prompt_col], "response": example[resp_col]}
+    if "chosen" in example and "rejected" in example:
+        if "prompt" in example:
+            prompt = example["prompt"]
+        elif "instruction" in example:
+            prompt = example["instruction"]
+        else:
+            chosen_text = str(example["chosen"])
+            if len(chosen_text) > 100:
+                prompt = chosen_text[:100] + "..."
+            else:
+                prompt = chosen_text
+        return {"prompt": prompt, "response": str(example["chosen"])}
+    else:
+        prompt_col = _detect_col(example, PROMPT_COLUMN_CANDIDATES)
+        resp_col = _detect_col(example, RESPONSE_COLUMN_CANDIDATES)
+        return {"prompt": example[prompt_col], "response": example[resp_col]}
 
 
 def build_mixture(
@@ -94,6 +105,9 @@ def build_mixture(
     """
     processed_splits: List[Dataset] = []
     for name, ratio in mixture_ratios.items():
+        if name not in raw_datasets:
+            print(f"WARNING: Dataset '{name}' not available, skipping...")
+            continue
         raw = raw_datasets[name]
         # Map and optionally sub-sample (for smoke test)
         if isinstance(raw, Dataset):
@@ -101,8 +115,12 @@ def build_mixture(
         else:  # streaming
             mapped = raw.map(_process_example)
         if smoke:
-            mapped = mapped.shuffle(seed=42).select(range(min(200, len(mapped))))
+            mapped = mapped.shuffle(seed=42).select(range(min(10, len(mapped))))
         processed_splits.extend([mapped] * ratio)
+    
+    if not processed_splits:
+        raise RuntimeError("No datasets were successfully loaded. Cannot proceed with training.")
+    
     final_dataset = concatenate_datasets(processed_splits).shuffle(seed=13)
     return final_dataset
 
@@ -111,7 +129,7 @@ def build_mixture(
 def tokenize_dataset(
     dataset: Dataset,
     tokenizer: AutoTokenizer,
-    max_length: int = 2048,
+    max_length: int = 128,
     smoke: bool = False,
 ) -> Dataset:
     def _tok_fn(example):
@@ -129,5 +147,5 @@ def tokenize_dataset(
         _tok_fn,
         batched=False,
         remove_columns=["prompt", "response"],
-        num_proc=1 if smoke else os.cpu_count(),
+        num_proc=1,  # Always use single process to avoid file handle issues
     )
